@@ -1,3 +1,3 @@
-#!/bin/bash
-# Run treecraft using the Python that has PyQt6 installed
-/usr/bin/python3 /home/alan/treecraft/treecraft.py "$@"
+#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+exec python3 "$SCRIPT_DIR/treecraft.py" "$@"
