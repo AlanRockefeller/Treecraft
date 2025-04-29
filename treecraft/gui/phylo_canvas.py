@@ -73,7 +73,7 @@ class TreeCanvas(QWidget):
         # For branch spacing
         self.vertical_spacing_factor = 0.9  # Start slightly condensed for vertical spacing
         self.horizontal_spacing_factor = 1.0
-        self.min_spacing = 0.15  # Allow much more compression of tree
+        self.min_spacing = 0.05  # Allow extremely high compression for large trees
         # Set different max values for horizontal and vertical to prevent runaway expansion
         self.max_horizontal_spacing = 3.0  # Allow more expansion as well
         self.max_vertical_spacing = 1.25  # Extremely conservative limit for vertical spacing
@@ -2217,7 +2217,7 @@ class TreeCanvas(QWidget):
                     # Apply horizontal spacing factor to leaf nodes too
                     # Ensure all leaf nodes are at the furthest depth for proper tree visualization
                     # This forces leaf nodes to be at the right edge of the tree
-                    min_x_per_level = 120  # Minimum pixels between levels (same as for internal nodes)
+                    min_x_per_level = 60  # Minimum pixels between levels (reduced for large RAxML trees)
                     
                     # For better positioning of leaf nodes, make sure they're at a consistent x-position
                     # For shallow trees, use direct level-based positioning
@@ -2229,12 +2229,12 @@ class TreeCanvas(QWidget):
                         # Adjust the position based on the compression level
                         if self.horizontal_spacing_factor < 0.5:
                             # When highly compressed, position leaves closer to the root
-                            # Scale from 75% at 0.5 down to 55% at 0.15 (min_spacing)
-                            width_percent = 0.55 + ((self.horizontal_spacing_factor - 0.15) / 0.35) * 0.2
+                            # Scale from 75% at 0.5 down to 45% at 0.05 (min_spacing)
+                            width_percent = 0.45 + ((self.horizontal_spacing_factor - 0.05) / 0.45) * 0.3
                             x = margin + (width * width_percent) * self.horizontal_spacing_factor
                         else:
-                            # Normal positioning at 85% of available width
-                            x = margin + (width * 0.85) * self.horizontal_spacing_factor
+                            # Normal positioning at 80% of available width (reduced for large trees)
+                            x = margin + (width * 0.8) * self.horizontal_spacing_factor
                     
                     # Add position index to the node ID to make it unique
                     leaf_position = current_leaf[0]
@@ -2275,7 +2275,7 @@ class TreeCanvas(QWidget):
                 
                 # Apply horizontal spacing factor to adjust branch lengths
                 # Ensure clear separation between tree levels for internal nodes
-                min_x_per_level = 120  # Minimum pixels between tree levels - increased for better visibility
+                min_x_per_level = 60  # Minimum pixels between tree levels - reduced for large RAxML trees
                 
                 # Calculate positions ensuring proper tree depth display
                 # For shallow trees, use direct proportional positioning
