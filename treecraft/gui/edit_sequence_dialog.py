@@ -126,5 +126,5 @@ class EditSequenceDialog(QDialog):
         """Return the edited sequence data"""
         # Make sure we're returning the current text from the description field
         # This is crucial - it should return the EDITED description
-        print(f"Debug - get_sequence_data returning: {self.original_id}, {self.sequence_id}, len={len(self.sequence)}, '{self.desc_edit.text()}'")
+        logger.debug(f"get_sequence_data returning: {self.original_id}, {self.sequence_id}, len={len(self.sequence)}, '{self.desc_edit.text()}'")
         return self.original_id, self.sequence_id, self.sequence, self.desc_edit.text()
