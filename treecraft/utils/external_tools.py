@@ -1,0 +1,2883 @@
+# treecraft/utils/external_tools.py
+import os
+import subprocess
+import time
+import logging
+import re
+from PyQt6.QtWidgets import QApplication, QMessageBox
+
+logger = logging.getLogger("treecraft.utils.external_tools")
+
+def log_command(cmd_list, description=None):
+    """Log command to INFO level and optionally display to stdout if --show-commandlines flag is set
+    
+    Args:
+        cmd_list: List of command arguments or a string with the complete command
+        description: Optional description of what the command does
+    """
+    # Convert list to string if needed
+    if isinstance(cmd_list, list):
+        cmd_str = " ".join(str(x) for x in cmd_list)
+    else:
+        cmd_str = str(cmd_list)
+        
+    # Construct the message
+    if description:
+        message = f"Running {description}: {cmd_str}"
+    else:
+        message = f"Running command: {cmd_str}"
+        
+    # Always log to INFO level
+    logger.info(message)
+    
+    # Print to stdout if requested via environment variable
+    if os.environ.get("TREECRAFT_SHOW_COMMANDLINES") == "1":
+        print(f"TreeCraft: {message}")
+
+def find_external_tool(tool_name):
+    """Find external tool executable in PATH or current directory"""
+    # This is a simplified version - would need adaptation for different OSes
+    if tool_name == "raxml":
+        possibilities = ["raxml-ng", "raxmlHPC-PTHREADS-AVX", "raxmlHPC-PTHREADS", "raxmlHPC", "raxml"]
+    elif tool_name == "raxml-ng":
+        possibilities = ["raxml-ng"]
+    elif tool_name == "raxml-pthreads":
+        possibilities = ["raxmlHPC-PTHREADS-AVX", "raxmlHPC-PTHREADS", "raxmlHPC-AVX", "raxmlHPC-MPI-AVX"]
+    elif tool_name == "raxml-std":
+        possibilities = ["raxmlHPC", "raxml", "raxmlHPC-SSE3", "raxmlHPC-AVX"]
+    elif tool_name == "mb":
+        possibilities = ["mb", "mrbayes"]
+    elif tool_name == "halign":
+        possibilities = ["halign"]
+    elif tool_name == "muscle":
+        possibilities = ["muscle", "muscle5", "muscle3"]
+    elif tool_name == "mafft":
+        possibilities = ["mafft"]
+    elif tool_name == "trimal":
+        possibilities = ["trimal"]
+    elif tool_name == "gblocks":
+        possibilities = ["Gblocks", "gblocks", "Gblocks_0.91b", "gblocks_0.91b"]  # Common Gblocks executable names
+    elif tool_name == "modeltest-ng":
+        possibilities = ["modeltest-ng"]
+    elif tool_name == "iqtree":
+        possibilities = ["iqtree", "iqtree2"]
+    else:
+        possibilities = [tool_name]
+    
+    # First, check in the system PATH
+    search_paths = os.environ.get("PATH", "").split(os.pathsep)
+    
+    # Also add the current directory to search path
+    search_paths.append(os.getcwd())
+    
+    # Add common binary directories on Unix systems
+    if os.name != 'nt':
+        search_paths.extend([
+            '/usr/bin',
+            '/usr/local/bin',
+            '/opt/homebrew/bin',  # For macOS homebrew
+            os.path.expanduser('~/anaconda3/bin'),  # Common Anaconda location
+            os.path.expanduser('~/miniconda3/bin'),  # Common Miniconda location
+            os.path.expanduser('~/bin'),  # User's bin directory
+            '/opt/local/bin'  # MacPorts location
+        ])
+    
+    # On Windows, also look for .exe extension
+    if os.name == 'nt':
+        possibilities_with_exe = [p + '.exe' for p in possibilities]
+        possibilities.extend(possibilities_with_exe)
+    
+    # Special additional directories for Gblocks (it's often installed in non-standard locations)
+    if tool_name == "gblocks":
+        if os.name != 'nt':  # Unix systems
+            search_paths.extend([
+                '/usr/local/gblocks',
+                '/usr/local/Gblocks',
+                '/opt/gblocks',
+                '/opt/Gblocks',
+                os.path.expanduser('~/gblocks'),
+                os.path.expanduser('~/Gblocks')
+            ])
+        else:  # Windows
+            search_paths.extend([
+                'C:\\Program Files\\Gblocks',
+                'C:\\Program Files (x86)\\Gblocks'
+            ])
+    
+    # Log all search paths for debugging
+    logger.debug(f"Searching for {tool_name} in the following paths: {search_paths}")
+    
+    # Search for the executable in all potential paths
+    for path_dir in search_paths:
+        for possibility in possibilities:
+            exe_file = os.path.join(path_dir, possibility)
+            if os.path.isfile(exe_file) and os.access(exe_file, os.X_OK):
+                logger.info(f"Found external tool {tool_name} at {exe_file}")
+                return exe_file
+    
+    # Special check for Gblocks using the 'which' command on Unix systems
+    if tool_name == "gblocks" and os.name != 'nt':
+        try:
+            logger.info("Trying to find Gblocks with 'which' command")
+            import subprocess
+            for possibility in possibilities:
+                logger.debug(f"Running 'which {possibility}'")
+                result = subprocess.run(['which', possibility], 
+                                     stdout=subprocess.PIPE, 
+                                     stderr=subprocess.PIPE,
+                                     text=True)
+                if result.returncode == 0 and result.stdout.strip():
+                    exe_file = result.stdout.strip()
+                    logger.info(f"Found Gblocks using 'which' command: {exe_file}")
+                    # Verify the file actually exists and is executable
+                    if os.path.isfile(exe_file) and os.access(exe_file, os.X_OK):
+                        return exe_file
+                    else:
+                        logger.warning(f"'which' found {exe_file} but it doesn't exist or isn't executable")
+                else:
+                    logger.debug(f"'which {possibility}' returned: {result.returncode}, stdout: {result.stdout.strip()}, stderr: {result.stderr.strip()}")
+        except Exception as e:
+            logger.error(f"Error using 'which' to find Gblocks: {e}")
+    
+    # If still not found, try direct execution as a last resort for Gblocks
+    if tool_name == "gblocks" and os.name != 'nt':
+        try:
+            logger.info("Trying direct command execution test for Gblocks")
+            import subprocess
+            for possibility in possibilities:
+                logger.debug(f"Testing direct execution of '{possibility}'")
+                # Just try to run it with --help or -h to see if it exists
+                result = subprocess.run([possibility, '-h'], 
+                                     stdout=subprocess.PIPE, 
+                                     stderr=subprocess.PIPE,
+                                     text=True)
+                # Even if it returns an error code, if we get any output it might be valid
+                if (result.stdout.strip() or result.stderr.strip()):
+                    logger.info(f"Found executable Gblocks as '{possibility}' (no path)")
+                    return possibility  # Return just the command name
+        except FileNotFoundError:
+            logger.debug(f"Direct execution test failed with FileNotFoundError")
+        except Exception as e:
+            logger.error(f"Error in direct execution test for Gblocks: {e}")
+    
+    # If not found in PATH or current directory
+    logger.warning(f"External tool {tool_name} not found in PATH or current directory")
+    return None
+    
+def get_available_alignment_methods():
+    """Get a list of available alignment methods with their display names"""
+    methods = []
+    
+    # Check for MAFFT (now the preferred method)
+    mafft_path = find_external_tool("mafft")
+    if mafft_path:
+        methods.append(("mafft", "MAFFT (recommended)"))
+    else:
+        methods.append(("mafft", "MAFFT (not found)"))
+    
+    # Check for MUSCLE
+    muscle_path = find_external_tool("muscle")
+    if muscle_path:
+        if not mafft_path:
+            methods.append(("muscle", "MUSCLE (recommended)"))
+        else:
+            methods.append(("muscle", "MUSCLE"))
+    else:
+        methods.append(("muscle", "MUSCLE (not found)"))
+    
+    # Check for halign
+    halign_path = find_external_tool("halign")
+    if halign_path:
+        methods.append(("halign", "halign"))
+    else:
+        methods.append(("halign", "halign (install for best results)"))
+    
+    # Always include the simple alignment as fallback
+    methods.append(("simple", "Simple alignment (basic)"))
+    
+    return methods
+
+
+
+
+def run_alignment_tool(method, input_path, output_path, progress=None):
+    """Run the selected alignment tool
+    
+    Args:
+        method: The alignment method to use (halign, muscle, mafft, or simple)
+        input_path: Path to the input FASTA file
+        output_path: Path to write the output alignment
+        progress: Optional progress dialog to update
+        
+    Returns:
+        True if alignment succeeded, False otherwise
+    """
+    if method == "halign":
+        return run_halign(input_path, output_path, progress)
+    elif method == "muscle":
+        return run_muscle(input_path, output_path, progress)
+    elif method == "mafft":
+        return run_mafft(input_path, output_path, progress)
+    else:
+        # Simple alignment is handled in the AlignmentThread directly
+        return False
+
+def run_halign(input_path, output_path, progress=None):
+    """Run halign for sequence alignment"""
+    halign_path = find_external_tool("halign")
+    if not halign_path:
+        logger.error("halign not found but was requested")
+        return False
+    
+    # Run halign with input and output files
+    # Command format: halign input.fasta output.aln
+    halign_cmd = [
+        halign_path,
+        input_path,
+        output_path
+    ]
+    
+    try:
+        logger.info(f"Running halign: {' '.join(halign_cmd)}")
+        
+        process = subprocess.Popen(
+            halign_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Monitor process
+        if progress:
+            while process.poll() is None:
+                # Update progress in the middle of the range
+                if hasattr(progress, 'setValue'):
+                    progress.setValue(50)
+                elif hasattr(progress, 'progress_update'):
+                    progress.progress_update.emit(50)
+                QApplication.processEvents()
+                if hasattr(progress, 'wasCanceled') and progress.wasCanceled():
+                    process.terminate()
+                    return False, {"message": "trimAl process canceled by user"}
+                time.sleep(0.1)
+                
+            # Set progress to nearly complete
+            if hasattr(progress, 'setValue'):
+                progress.setValue(90)
+            elif hasattr(progress, 'progress_update'):
+                progress.progress_update.emit(90)
+        else:
+            process.wait()
+        
+        # Check if halign succeeded
+        if process.returncode == 0:
+            logger.info("halign completed successfully")
+            return True
+        else:
+            stderr = process.stderr.read() if process.stderr else ""
+            logger.error(f"halign failed with return code {process.returncode}: {stderr}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error running halign: {str(e)}")
+        return False
+
+def run_muscle(input_path, output_path, progress=None):
+    """Run MUSCLE for sequence alignment"""
+    muscle_path = find_external_tool("muscle")
+    if not muscle_path:
+        logger.error("MUSCLE not found but was requested")
+        return False
+    
+    try:
+        from Bio.Align.Applications import MuscleCommandline
+        
+        # Create MUSCLE command line
+        muscle_cline = MuscleCommandline(muscle_path, input=input_path, out=output_path)
+        logger.info(f"Running MUSCLE: {muscle_cline}")
+        
+        # Run MUSCLE
+        process = subprocess.Popen(
+            str(muscle_cline).split(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Monitor process
+        if progress:
+            while process.poll() is None:
+                # Update progress in the middle of the range
+                if hasattr(progress, 'setValue'):
+                    progress.setValue(50)
+                elif hasattr(progress, 'progress_update'):
+                    progress.progress_update.emit(50)
+                QApplication.processEvents()
+                if hasattr(progress, 'wasCanceled') and progress.wasCanceled():
+                    process.terminate()
+                    return False, {"message": "trimAl process canceled by user"}
+                time.sleep(0.1)
+                
+            # Set progress to nearly complete
+            if hasattr(progress, 'setValue'):
+                progress.setValue(90)
+            elif hasattr(progress, 'progress_update'):
+                progress.progress_update.emit(90)
+        else:
+            process.wait()
+        
+        # Check if MUSCLE succeeded
+        if process.returncode == 0:
+            logger.info("MUSCLE completed successfully")
+            return True
+        else:
+            stderr = process.stderr.read() if process.stderr else ""
+            logger.error(f"MUSCLE failed with return code {process.returncode}: {stderr}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error running MUSCLE: {str(e)}")
+        return False
+
+def run_mafft(input_path, output_path, progress=None):
+    """Run MAFFT for sequence alignment"""
+    import threading
+    import select
+    import io
+    
+    mafft_path = find_external_tool("mafft")
+    if not mafft_path:
+        logger.error("MAFFT not found but was requested")
+        return False
+    
+    # Run MAFFT with --auto option for automatic determination of appropriate strategy
+    # Command format: mafft --auto input.fasta > output.aln
+    try:
+        mafft_cmd = [
+            mafft_path,
+            "--auto",
+            input_path
+        ]
+        
+        logger.info(f"Running MAFFT: {' '.join(mafft_cmd)}")
+        
+        # Create output file
+        with open(output_path, 'w') as out_file:
+            # Start process with non-blocking pipes
+            process = subprocess.Popen(
+                mafft_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,  # Unbuffered
+                text=False  # Binary mode
+            )
+            
+            # Make stdout and stderr non-blocking
+            import fcntl
+            import os
+            
+            # Set non-blocking mode for both pipes
+            for pipe in [process.stdout, process.stderr]:
+                fd = pipe.fileno()
+                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+                fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+            
+            # Create buffers for stdout and stderr
+            stdout_buffer = io.StringIO()
+            stderr_buffer = io.StringIO()
+            
+            # Tracking variables
+            stdout_closed = False
+            stderr_closed = False
+            
+            # Regular expression to extract segment info
+            segment_pattern = re.compile(r'Segment\s+(\d+)/\s*(\d+)')
+            total_segments = 0
+            current_segment = 0
+            last_progress_time = time.time()
+            last_update_time = time.time()
+            
+            # Define a helper function to log current status
+            def log_current_status():
+                if total_segments > 0:
+                    logger.debug(f"MAFFT progress: segment {current_segment}/{total_segments}")
+                else:
+                    logger.debug("MAFFT running (segments not yet detected)")
+            
+            # Main monitoring loop
+            while not (stdout_closed and stderr_closed):
+                # Use select to wait for data on either pipe
+                ready_to_read, _, _ = select.select(
+                    [p for p in [process.stdout, process.stderr] if p and not (p is process.stdout and stdout_closed) and not (p is process.stderr and stderr_closed)],
+                    [], [], 0.1)
+                
+                # Read data from ready pipes
+                for pipe in ready_to_read:
+                    try:
+                        data = pipe.read(4096)  # Read chunks of data
+                        if not data:  # EOF
+                            if pipe is process.stdout:
+                                stdout_closed = True
+                            else:
+                                stderr_closed = True
+                            continue
+                            
+                        # Convert binary data to text
+                        text = data.decode('utf-8', errors='replace')
+                        
+                        # Process the output
+                        if pipe is process.stdout:
+                            # Write directly to the output file
+                            out_file.write(text)
+                            out_file.flush()
+                        else:  # stderr
+                            # Process for progress information
+                            stderr_buffer.write(text)
+                            stderr_buffer.seek(0)
+                            stderr_content = stderr_buffer.getvalue()
+                            
+                            # Look for segment information
+                            for match in segment_pattern.finditer(stderr_content):
+                                current_segment = int(match.group(1))
+                                total_segments = int(match.group(2))
+                                
+                                # Only update progress at reasonable intervals to avoid GUI freezes
+                                now = time.time()
+                                if now - last_update_time >= 0.2:  # 200ms update interval
+                                    # Update progress based on segment information
+                                    if progress and total_segments > 0:
+                                        # Scale to 0-90 range (save the last 10% for post-processing)
+                                        progress_value = int((current_segment / total_segments) * 90)
+                                        
+                                        if hasattr(progress, 'setValue'):
+                                            progress.setValue(progress_value)
+                                        elif hasattr(progress, 'progress_update'):
+                                            progress.progress_update.emit(progress_value)
+                                    
+                                    last_update_time = now
+                            
+                            # Log status periodically
+                            now = time.time()
+                            if now - last_progress_time >= 5.0:  # Log every 5 seconds
+                                log_current_status()
+                                last_progress_time = now
+                    
+                    except (IOError, OSError) as e:
+                        # Handle pipe errors (could be due to non-blocking mode)
+                        import errno
+                        if e.errno != errno.EAGAIN and e.errno != errno.EWOULDBLOCK:
+                            logger.error(f"Error reading from MAFFT process: {e}")
+                            break
+                
+                # Check for process completion
+                if process.poll() is not None:
+                    # Process has ended, ensure we've read all data
+                    try:
+                        remaining_stdout = process.stdout.read()
+                        if remaining_stdout:
+                            out_file.write(remaining_stdout.decode('utf-8', errors='replace'))
+                            out_file.flush()
+                    except (IOError, OSError):
+                        pass
+                        
+                    try:
+                        remaining_stderr = process.stderr.read()
+                        if remaining_stderr:
+                            stderr_buffer.write(remaining_stderr.decode('utf-8', errors='replace'))
+                    except (IOError, OSError):
+                        pass
+                    
+                    break
+                
+                # Check for cancellation
+                QApplication.processEvents()
+                if progress and hasattr(progress, 'wasCanceled') and progress.wasCanceled():
+                    process.terminate()
+                    logger.info("MAFFT alignment canceled by user")
+                    return False
+            
+            # Process has completed
+            returncode = process.wait()
+            
+            # Get full stderr content for logging/error reporting
+            stderr_content = stderr_buffer.getvalue()
+            
+            # Update progress to nearly complete
+            if progress:
+                if hasattr(progress, 'setValue'):
+                    progress.setValue(95)
+                elif hasattr(progress, 'progress_update'):
+                    progress.progress_update.emit(95)
+            
+            # Check if MAFFT succeeded
+            if returncode == 0:
+                logger.info("MAFFT completed successfully")
+                # Update progress to complete
+                if progress:
+                    if hasattr(progress, 'setValue'):
+                        progress.setValue(100)
+                    elif hasattr(progress, 'progress_update'):
+                        progress.progress_update.emit(100)
+                return True
+            else:
+                logger.error(f"MAFFT failed with return code {returncode}: {stderr_content}")
+                return False
+                
+    except Exception as e:
+        import traceback
+        logger.error(f"Error running MAFFT: {str(e)}\n{traceback.format_exc()}")
+        return False
+
+def run_trimal(input_path, output_path, gap_threshold=0.5, cons_threshold=0.6, progress=None):
+    """Run trimAl for alignment trimming
+    
+    Args:
+        input_path: Path to the input alignment file
+        output_path: Path to write the trimmed alignment
+        gap_threshold: Gap threshold (0-1)
+        cons_threshold: Conservation threshold (0-1)
+        progress: Optional progress dialog to update
+        
+    Returns:
+        Tuple of (success, info_dict) where:
+          - success is True if trimming succeeded, False otherwise
+          - info_dict contains information about the trimming process:
+            - original_count: Number of positions in original alignment
+            - trimmed_count: Number of positions in trimmed alignment
+            - percent_kept: Percentage of positions kept
+    """
+    trimal_path = find_external_tool("trimal")
+    if not trimal_path:
+        logger.error("trimAl not found")
+        QMessageBox.warning(None, "Tool Not Found", 
+                            "trimAl was not found in your PATH. Please install trimAl or add it to your PATH.")
+        return False, {"message": "trimAl not found in PATH"}
+    
+    # Run trimAl with input and output files
+    # Command format: trimal -in input.fasta -out output.fasta -gt 0.5 -cons 60
+    trimal_cmd = [
+        trimal_path,
+        "-in", input_path,
+        "-out", output_path,
+        "-gt", str(gap_threshold),
+        "-cons", str(int(cons_threshold * 100))
+    ]
+    
+    try:
+        logger.info(f"Running trimAl: {' '.join(trimal_cmd)}")
+        
+        process = subprocess.Popen(
+            trimal_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Monitor process
+        if progress:
+            while process.poll() is None:
+                if hasattr(progress, 'setValue'):
+                    progress.setValue(50)
+                QApplication.processEvents()
+                if hasattr(progress, 'wasCanceled') and progress.wasCanceled():
+                    process.terminate()
+                    return False, {"message": "trimAl process canceled by user"}
+                time.sleep(0.1)
+                
+            if hasattr(progress, 'setValue'):
+                progress.setValue(90)
+        else:
+            process.wait()
+        
+        # Check if trimAl succeeded
+        if process.returncode == 0:
+            logger.info("trimAl completed successfully")
+            
+            # Calculate alignment statistics
+            try:
+                from Bio import SeqIO
+                # Get original alignment length
+                original_records = list(SeqIO.parse(input_path, "fasta"))
+                trimmed_records = list(SeqIO.parse(output_path, "fasta"))
+                
+                if original_records and trimmed_records:
+                    original_count = len(str(original_records[0].seq))
+                    trimmed_count = len(str(trimmed_records[0].seq))
+                    percent_kept = round((trimmed_count / original_count) * 100, 2) if original_count > 0 else 0
+                    
+                    info_dict = {
+                        "original_count": original_count,
+                        "trimmed_count": trimmed_count,
+                        "percent_kept": percent_kept,
+                        "message": f"trimAl removed {original_count - trimmed_count} out of {original_count} positions ({percent_kept}% kept)"
+                    }
+                    logger.info(info_dict["message"])
+                    return True, info_dict
+                else:
+                    # Return basic success message if we couldn't get details
+                    return True, {"message": "trimAl completed successfully"}
+            except Exception as e:
+                logger.error(f"Error calculating trimAl statistics: {e}")
+                return True, {"message": "trimAl completed successfully"}
+        else:
+            stderr = process.stderr.read() if process.stderr else ""
+            logger.error(f"trimAl failed with return code {process.returncode}: {stderr}")
+            return False, {"message": f"trimAl failed: {stderr}"}
+            
+    except Exception as e:
+        logger.error(f"Error running trimAl: {str(e)}")
+        return False, {"message": f"Error running trimAl: {str(e)}"}
+
+def run_gblocks(input_path, output_path, params=None, progress=None):
+    """Run Gblocks for alignment trimming
+    
+    Args:
+        input_path: Path to the input alignment file
+        output_path: Path to write the trimmed alignment
+        params: Dictionary of parameters for Gblocks
+        progress: Optional progress dialog to update
+        
+    Returns:
+        Tuple of (success, info_dict) where:
+          - success is True if trimming succeeded, False otherwise
+          - info_dict contains information about the trimming process:
+            - original_count: Number of positions in original alignment
+            - trimmed_count: Number of positions in trimmed alignment
+            - percent_kept: Percentage of positions kept
+    """
+    # Get logger
+    logger = logging.getLogger("treecraft.utils.external_tools")
+    
+    # First check if we have a custom Gblocks path stored in the dialog that called us
+    gblocks_path = None
+    
+    # Try to get the caller's frame to check for a custom path
+    import inspect
+    caller_frame = inspect.currentframe().f_back
+    if caller_frame:
+        # Look for an object with gblocks_path attribute in the local variables
+        for var_name, var_value in caller_frame.f_locals.items():
+            if hasattr(var_value, 'gblocks_path') and var_value.gblocks_path:
+                gblocks_path = var_value.gblocks_path
+                logger.info(f"Using custom Gblocks path from caller: {gblocks_path}")
+                break
+    
+    # If no custom path found, use the standard detection
+    if not gblocks_path:
+        gblocks_path = find_external_tool("gblocks")
+        
+    if not gblocks_path:
+        logger.error("Gblocks not found")
+        QMessageBox.warning(None, "Tool Not Found", 
+                            "Gblocks was not found in your PATH. Please install Gblocks or add it to your PATH.")
+        return False
+    
+    # Verify the Gblocks path is valid without trying to execute it
+    import os
+    if not os.path.isfile(gblocks_path) or not os.access(gblocks_path, os.X_OK):
+        logger.error(f"Gblocks path {gblocks_path} is not a valid executable")
+        QMessageBox.warning(None, "Invalid Executable", 
+                          f"The Gblocks executable at {gblocks_path} is not valid or doesn't have execution permissions.")
+        return False
+    
+    # Gblocks has a different output naming scheme
+    # It adds "-gb" to the input filename
+    input_base = os.path.basename(input_path)
+    input_dir = os.path.dirname(input_path)
+    gblocks_out = os.path.join(input_dir, input_base + "-gb")
+    
+    # Set default parameters if none provided
+    if params is None:
+        params = {
+            "b1": "0.8",  # Min sequence identity for conserved position
+            "b2": "0.8",  # Min sequence identity for flank position
+            "b3": "10",   # Max number of contiguous non-conserved positions
+            "b4": "2",    # Min block length
+            "b5": "a"     # Gap treatment (a/h/n)
+        }
+    
+    # Gblocks has issues with long sequence names - we need to create a temporary file with shortened names
+    # Create a modified version of the input file with shortened sequence names
+    shortnames_path = os.path.join(input_dir, "gblocks_input_shortnames.fa")
+    name_mapping = {}  # Keep track of original to shortened names
+    
+    try:
+        # Create a shortened sequence name file
+        from Bio import SeqIO
+        try:
+            logger.info(f"Creating shortened sequence names for Gblocks from: {input_path}")
+            records = list(SeqIO.parse(input_path, "fasta"))
+            with open(shortnames_path, "w") as f:
+                for i, record in enumerate(records):
+                    # Store the mapping of short to original names
+                    short_name = f"seq{i+1}"
+                    name_mapping[short_name] = record.id
+                    
+                    # Write record with shortened name
+                    f.write(f">{short_name}\n{record.seq}\n")
+                    
+            logger.info(f"Created shortened names file at: {shortnames_path}")
+            
+            # Now use the shortened names file for Gblocks
+            input_path = shortnames_path
+            gblocks_out = shortnames_path + "-gb"
+            logger.info(f"Using shortened names file as input. Expected output: {gblocks_out}")
+        except Exception as e:
+            logger.error(f"Error creating shortened names file: {e}")
+            # Continue with original file if this fails
+            logger.warning("Continuing with original file names - Gblocks may fail")
+    
+        # Run Gblocks with input file
+        # Command format: Gblocks input.fasta -t=d -b1=50 -b2=50 -b3=12 -b4=2 -b5=a
+        gblocks_cmd = [
+            gblocks_path,
+            input_path,
+            "-t=d"  # DNA sequences
+        ]
+        
+        # Add parameters
+        for param, value in params.items():
+            gblocks_cmd.append(f"-{param}={value}")
+        
+        logger.info(f"Running Gblocks: {' '.join(gblocks_cmd)}")
+        
+        # Set a reasonable timeout (5 minutes)
+        timeout_seconds = 300
+        
+        process = subprocess.Popen(
+            gblocks_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Monitor process with timeout handling
+        start_time = time.time()
+        if progress:
+            while process.poll() is None:
+                if hasattr(progress, 'setValue'):
+                    progress.setValue(50)
+                QApplication.processEvents()
+                if hasattr(progress, 'wasCanceled') and progress.wasCanceled():
+                    process.terminate()
+                    logger.warning("Gblocks process canceled by user")
+                    return False
+                
+                # Check for timeout
+                if time.time() - start_time > timeout_seconds:
+                    process.terminate()
+                    logger.error(f"Gblocks process timed out after {timeout_seconds} seconds")
+                    QMessageBox.warning(None, "Process Timeout", 
+                                      f"Gblocks process timed out after {timeout_seconds} seconds.")
+                    return False
+                    
+                time.sleep(0.1)
+                
+            if hasattr(progress, 'setValue'):
+                progress.setValue(90)
+        else:
+            # If no progress dialog, use communicate with timeout
+            try:
+                stdout, stderr = process.communicate(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                logger.error(f"Gblocks process timed out after {timeout_seconds} seconds")
+                QMessageBox.warning(None, "Process Timeout", 
+                                  f"Gblocks process timed out after {timeout_seconds} seconds.")
+                return False
+        
+        # Special case for Gblocks: Many versions return exit code 1 even when they succeed
+        # So we need to check if the output file was created regardless of the return code
+        if os.path.exists(gblocks_out):
+            logger.info(f"Gblocks output file found at {gblocks_out} - considering run successful despite possible return code")
+            
+            # Check if we used shortened names and need to restore original names
+            if name_mapping:
+                logger.info("Restoring original sequence names in the output file")
+                try:
+                    from Bio import SeqIO
+                    # Read the Gblocks output
+                    records = list(SeqIO.parse(gblocks_out, "fasta"))
+                    
+                    # Write to destination with original names
+                    with open(output_path, 'w') as out:
+                        for record in records:
+                            # Get original name if available, otherwise keep the shortened name
+                            original_name = name_mapping.get(record.id, record.id)
+                            out.write(f">{original_name}\n{record.seq}\n")
+                            
+                    # Calculate statistics about the alignment
+                    original_count = 0
+                    trimmed_count = 0
+                    
+                    try:
+                        # Get original alignment length
+                        original_records = list(SeqIO.parse(input_path, "fasta"))
+                        if original_records:
+                            original_count = len(str(original_records[0].seq))
+                        
+                        # Get trimmed alignment length
+                        if records:
+                            trimmed_count = len(str(records[0].seq))
+                            
+                        # Calculate percentage kept
+                        percent_kept = round((trimmed_count / original_count) * 100, 2) if original_count > 0 else 0
+                        
+                        # Create info dictionary
+                        info_dict = {
+                            "original_count": original_count,
+                            "trimmed_count": trimmed_count,
+                            "percent_kept": percent_kept,
+                            "message": f"Gblocks removed {original_count - trimmed_count} out of {original_count} positions ({percent_kept}% kept)"
+                        }
+                        logger.info(info_dict["message"])
+                        
+                        logger.info(f"Successfully restored original sequence names in: {output_path}")
+                        return True, info_dict
+                    except Exception as e:
+                        logger.error(f"Error calculating alignment statistics: {e}")
+                        # Return success but with limited info
+                        return True, {"message": "Gblocks completed successfully, but statistics unavailable"}
+                except Exception as e:
+                    logger.error(f"Error restoring original names: {e}")
+                    # Fall back to direct copy if this fails
+                    logger.warning("Falling back to direct copy with shortened names")
+            
+            # If no name mapping or the restoration failed, do a direct copy
+            with open(gblocks_out, 'r') as src, open(output_path, 'w') as dst:
+                dst.write(src.read())
+                
+            # Try to compute statistics even with direct copy
+            try:
+                from Bio import SeqIO
+                original_records = list(SeqIO.parse(input_path.replace("_shortnames", ""), "fasta"))
+                trimmed_records = list(SeqIO.parse(output_path, "fasta"))
+                
+                if original_records and trimmed_records:
+                    original_count = len(str(original_records[0].seq))
+                    trimmed_count = len(str(trimmed_records[0].seq))
+                    percent_kept = round((trimmed_count / original_count) * 100, 2) if original_count > 0 else 0
+                    
+                    info_dict = {
+                        "original_count": original_count,
+                        "trimmed_count": trimmed_count,
+                        "percent_kept": percent_kept,
+                        "message": f"Gblocks removed {original_count - trimmed_count} out of {original_count} positions ({percent_kept}% kept)"
+                    }
+                    return True, info_dict
+            except Exception as e:
+                logger.error(f"Error calculating alignment statistics on direct copy: {e}")
+                
+            # Return success but with no detailed info
+            return True, {"message": "Gblocks trimming completed successfully"}
+        else:
+            stderr = process.stderr.read() if process.stderr else ""
+            stdout = process.stdout.read() if process.stdout else ""
+            
+            logger.error(f"Gblocks failed with return code {process.returncode}")
+            logger.error(f"  STDERR: {stderr}")
+            logger.error(f"  STDOUT: {stdout}")
+            logger.error(f"  No output file found at expected location: {gblocks_out}")
+            
+            # Check if any other potential output files were created with different extensions
+            possible_outputs = [
+                os.path.join(input_dir, input_base + "-gb"),
+                os.path.join(input_dir, input_base + ".gb"),
+                os.path.join(input_dir, input_base + "_gb"),
+                os.path.join(input_dir, input_base + ".gblocks"),
+                os.path.join(input_dir, os.path.splitext(input_base)[0] + "-gb")
+            ]
+            
+            # Log if we find any potential outputs in different formats
+            for potential_file in possible_outputs:
+                if os.path.exists(potential_file) and potential_file != gblocks_out:
+                    logger.info(f"Found potential alternative Gblocks output at: {potential_file}")
+                    # Try to use this file instead
+                    try:
+                        with open(potential_file, 'r') as src, open(output_path, 'w') as dst:
+                            dst.write(src.read())
+                        logger.info(f"Using alternative Gblocks output file: {potential_file}")
+                        return True
+                    except Exception as e:
+                        logger.error(f"Error using alternative output file: {e}")
+            
+            # If we get here, we couldn't find any usable output
+            QMessageBox.warning(None, "Gblocks Error", 
+                              f"Gblocks failed to trim the alignment properly.\n\n" + 
+                              f"No valid output file was found.\n\n" +
+                              f"Try using trimAl instead, or check your input alignment.")
+            return False, {"message": "Gblocks failed to trim the alignment"}
+            
+    except Exception as e:
+        import traceback
+        logger.error(f"Error running Gblocks: {str(e)}")
+        logger.error(traceback.format_exc())
+        QMessageBox.critical(None, "Gblocks Error", 
+                           f"An error occurred while running Gblocks: {str(e)}")
+        return False, {"message": f"Error running Gblocks: {str(e)}"}
+
+def parse_modeltest_output(content):
+    """Parse ModelTest-NG output to extract models for each criterion.
+    
+    Args:
+        content: The content of the ModelTest-NG output file
+        
+    Returns:
+        Dictionary with models for each criterion (BIC, AIC, AICc)
+    """
+    logger.info("Parsing ModelTest-NG output with improved parser")
+    models = {"BIC": None, "AIC": None, "AICc": None}
+    
+    # Use regex to find all model sections and extract models
+    for criterion in ["BIC", "AIC", "AICc"]:
+        # Find section starting with "Best model according to X" followed by dashes and then "Model:"
+        section_pattern = f"Best model according to {criterion}\\s*\\n-+\\s*\\nModel:\\s+(\\S+)"
+        
+        import re
+        match = re.search(section_pattern, content, re.MULTILINE)
+        
+        if match:
+            model_value = match.group(1).strip()
+            models[criterion] = model_value
+            logger.info(f"Regex found {criterion} model: {model_value}")
+        else:
+            logger.warning(f"Could not find model for {criterion} using regex")
+            
+            # Fallback to manual line scanning for this criterion
+            criterion_header = f"Best model according to {criterion}"
+            lines = content.split('\n')
+            
+            for i, line in enumerate(lines):
+                if criterion_header in line and i+2 < len(lines):
+                    # Debug what we found
+                    logger.debug(f"Found header at line {i}: '{line}'")
+                    logger.debug(f"Next line: '{lines[i+1]}'")
+                    logger.debug(f"Model line candidate: '{lines[i+2]}'")
+                    
+                    # Model name is typically two lines down after separator line
+                    model_line = lines[i+2].strip()
+                    if model_line.startswith("Model:"):
+                        model_value = model_line.split(":", 1)[1].strip()
+                        models[criterion] = model_value
+                        logger.info(f"Manual scan found {criterion} model: {model_value}")
+                        break
+    
+    return models
+
+def run_modeltest(input_path, output_path=None, progress=None):
+    """Run ModelTest-NG to find the best evolutionary model
+    
+    Args:
+        input_path: Path to the input alignment file
+        output_path: Path to write the model output (optional)
+        progress: Optional progress dialog to update
+        
+    Returns:
+        Best model name as string or None if it failed
+    """
+    # Import modules needed throughout this function
+    import glob
+    import re
+    
+    modeltest_path = find_external_tool("modeltest-ng")
+    if not modeltest_path:
+        logger.error("ModelTest-NG not found")
+        QMessageBox.warning(None, "Tool Not Found", 
+                           "ModelTest-NG was not found in your PATH. Please install ModelTest-NG or add it to your PATH.")
+        return None
+    
+    # Set up temp output if not provided
+    if output_path is None:
+        output_path = input_path + ".models"
+    
+    # Run ModelTest-NG with input file
+    # Command format: modeltest-ng -i input.fasta -o output.txt
+    modeltest_cmd = [
+        modeltest_path,
+        "-i", input_path,
+        "-o", output_path,
+        "-d", "nt"  # DNA sequences
+    ]
+    
+    try:
+        # Log the command with our helper function
+        log_command(modeltest_cmd, "ModelTest-NG")
+        
+        process = subprocess.Popen(
+            modeltest_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Monitor process
+        if progress:
+            while process.poll() is None:
+                if hasattr(progress, 'setValue'):
+                    progress.setValue(50)
+                if hasattr(progress, 'setLabelText'):
+                    progress.setLabelText("Running ModelTest-NG to find best model...")
+                QApplication.processEvents()
+                if hasattr(progress, 'wasCanceled') and progress.wasCanceled():
+                    process.terminate()
+                    return None
+                time.sleep(0.1)
+                
+            if hasattr(progress, 'setValue'):
+                progress.setValue(90)
+        else:
+            process.wait()
+        
+        # Check if ModelTest-NG succeeded
+        if process.returncode == 0 and os.path.exists(output_path):
+            logger.info("ModelTest-NG completed successfully")
+            
+            # Parse the output to find the best models for all criteria
+            models = {"BIC": None, "AIC": None, "AICc": None}
+            try:
+                logger.info(f"Parsing ModelTest-NG output from: {output_path}")
+                
+                # Check for output file - modeltest-ng creates an .out file by default
+                output_file = output_path + ".out"
+                if os.path.exists(output_file):
+                    logger.info(f"Found ModelTest-NG detailed output file: {output_file}")
+                    
+                    # DEBUG: Log sample of file content for debugging
+                    try:
+                        with open(output_file, 'r') as out_f:
+                            sample = out_f.read(1000)
+                            logger.debug(f"Start of ModelTest-NG output file:\n{sample}")
+                    except Exception as sample_error:
+                        logger.warning(f"Failed to read sample: {sample_error}")
+                        
+                    # Open the complete file for parsing
+                    with open(output_file, 'r') as out_f:
+                        content = out_f.read()
+                        logger.info(f"Read {len(content)} characters from {output_file}")
+                        
+                        # If the content has ModelTest-NG header, we're on the right track
+                        if "ModelTest-NG" in content:
+                            logger.info("Found ModelTest-NG header in output file")
+                            
+                            # Use our improved dedicated parser function
+                            parsed_models = parse_modeltest_output(content)
+                            logger.info(f"Parser results: {parsed_models}")
+                            
+                            # Update our models dictionary with any found values
+                            for criterion in ["BIC", "AIC", "AICc"]:
+                                if parsed_models[criterion]:
+                                    models[criterion] = parsed_models[criterion]
+                                    logger.info(f"Parsed {criterion} model: {models[criterion]}")
+                                    
+                            # If parser didn't find models, try direct grep command on the file
+                            if not any(models.values()):
+                                logger.warning("Improved parser didn't find models, trying grep command directly")
+                                try:
+                                    # We'll use grep directly to find the models in the file
+                                    for criterion in ["BIC", "AIC", "AICc"]:
+                                        cmd = ["grep", "-A", "3", f"Best model according to {criterion}", output_file]
+                                        result = subprocess.run(cmd, capture_output=True, text=True)
+                                        if result.returncode == 0 and result.stdout:
+                                            logger.info(f"Grep result for {criterion}: {result.stdout}")
+                                            lines = result.stdout.strip().split('\n')
+                                            
+                                            # Debug the output format
+                                            logger.debug(f"Format for {criterion}: {len(lines)} lines")
+                                            for i, line in enumerate(lines):
+                                                logger.debug(f"Line {i}: {line}")
+                                                
+                                            # Standard format: Model is always 2 lines after header (after dashed line)
+                                            if len(lines) >= 3 and lines[2].strip().startswith("Model:"):
+                                                model_line = lines[2].strip()
+                                                model_parts = model_line.split("Model:", 1)
+                                                if len(model_parts) > 1:
+                                                    model_name = model_parts[1].strip()
+                                                    models[criterion] = model_name
+                                                    logger.info(f"Grep found {criterion} model: {model_name}")
+                                except Exception as grep_err:
+                                    logger.error(f"Error running grep: {grep_err}")
+                        else:
+                            logger.warning("Output file does not appear to be valid ModelTest-NG output")
+                else:
+                    # Read from the original output path
+                    logger.warning(f".out file not found, trying original path: {output_path}")
+                    with open(output_path, 'r') as f:
+                        content = f.read()
+                        logger.info(f"Read {len(content)} characters from {output_path}")
+                        
+                        # Try a simpler approach using more direct pattern matching
+                        for criterion in ["BIC", "AIC", "AICc"]:
+                            pattern = f"Best model according to {criterion}"
+                            pos = content.find(pattern)
+                            if pos != -1:
+                                # Extract up to 15 lines after this pattern
+                                section = content[pos:pos+500]  # Get a good chunk of text
+                                lines = section.splitlines()
+                                
+                                if len(lines) >= 3:  # Ensure we have enough lines
+                                    logger.debug(f"Found pattern for {criterion}, section: {lines[:5]}")
+                                    
+                                    # Look for 'Model:' prefix in the first few lines
+                                    for i in range(1, min(10, len(lines))):
+                                        line = lines[i].strip()
+                                        if line.startswith("Model:"):
+                                            model_value = line[6:].strip()  # Extract after "Model:"
+                                            models[criterion] = model_value
+                                            logger.info(f"Extracted {criterion} model: {model_value}")
+                                            break
+                    
+                    # If we couldn't find any models directly, try another approach
+                    if not any(models.values()):
+                        # Try a more direct search on specific lines using grep-like scan
+                        logger.warning("Direct section search failed, trying line-by-line scan")
+                        with open(output_path + ".out", 'r') as f:
+                            in_section = False
+                            current_criterion = None
+                            
+                            for line in f:
+                                line = line.strip()
+                                
+                                # Check if we're entering a "Best model according to X" section
+                                for criterion in ["BIC", "AIC", "AICc"]:
+                                    if f"Best model according to {criterion}" in line:
+                                        in_section = True
+                                        current_criterion = criterion
+                                        logger.debug(f"Found header for {criterion}")
+                                        break
+                                
+                                # If we're in a best model section, first skip the dashed separator line
+                                # Then look for the model line
+                                if in_section:
+                                    # Skip the separator line (full of dashes)
+                                    if line.startswith("-----"):
+                                        continue
+                                        
+                                    # Look for the model line
+                                    if line.startswith("Model:"):
+                                        model_value = line[6:].strip()  # Extract after "Model:"
+                                        models[current_criterion] = model_value
+                                        logger.info(f"Line scan found {current_criterion} model: {model_value}")
+                                        in_section = False  # Reset for next section
+                
+                # Last resort: Try to find models in the specific output file or related files
+                if not any(models.values()):
+                    logger.warning("All parsing attempts failed, searching for specific ModelTest-NG output files")
+                    # Using glob from main imports (should be imported at top of function)
+                    
+                    # Define the expected output file paths
+                    output_file = output_path + ".out"
+                    base_filename = os.path.basename(output_path)
+                    
+                    # First try the specific output file that should have been created
+                    model_files = []
+                    if os.path.exists(output_file):
+                        logger.info(f"Found expected output file: {output_file}")
+                        model_files.append(output_file)
+                    else:
+                        logger.warning(f"Expected output file not found: {output_file}")
+                        
+                        # If the specific file doesn't exist, look for files with matching base name
+                        # but only in the same directory and only with matching prefix
+                        tmp_dir = os.path.dirname(output_path)
+                        prefix = os.path.basename(output_path)
+                        
+                        # Look for files that start with the same prefix as our output file
+                        potential_files = glob.glob(os.path.join(tmp_dir, f"{prefix}*.out"))
+                        for file in potential_files:
+                            logger.info(f"Found potential ModelTest-NG output file: {file}")
+                            model_files.append(file)
+                            
+                        # If still no files found, use creation time as a filter
+                        if not model_files and os.path.exists(tmp_dir):
+                            logger.warning("No prefix-matching files found, checking for recently created model output files")
+                            all_model_files = glob.glob(os.path.join(tmp_dir, "*.models.out"))
+                            
+                            # Get the most recently created/modified modeltest output file
+                            if all_model_files:
+                                # Sort by modification time, newest first
+                                all_model_files.sort(key=os.path.getmtime, reverse=True)
+                                newest_file = all_model_files[0]
+                                # Only use the file if it was modified in the last 5 minutes
+                                file_mtime = os.path.getmtime(newest_file)
+                                if (time.time() - file_mtime) < 300:  # 5 minutes in seconds
+                                    logger.info(f"Found recent ModelTest-NG output file: {newest_file} (modified {int(time.time() - file_mtime)} seconds ago)")
+                                    model_files.append(newest_file)
+                                else:
+                                    logger.warning(f"Found ModelTest-NG output file {newest_file} but it's too old (modified {int(time.time() - file_mtime)} seconds ago)")
+                    
+                    # Process all candidate files
+                    for model_file in model_files:
+                        logger.info(f"Checking model file: {model_file}")
+                        try:
+                            with open(model_file, 'r') as f:
+                                content = f.read()
+                                logger.info(f"Read {len(content)} bytes from {model_file}")
+                                
+                                # Use our improved parser function
+                                file_models = parse_modeltest_output(content)
+                                
+                                # Update any models we found
+                                for criterion in ["BIC", "AIC", "AICc"]:
+                                    if file_models[criterion] and not models[criterion]:
+                                        models[criterion] = file_models[criterion]
+                                        logger.info(f"Found {criterion} model in file {model_file}: {models[criterion]}")
+                                    
+                        except Exception as e:
+                            logger.error(f"Error reading model file {model_file}: {e}")
+                            logger.error(traceback.format_exc())
+                
+                # Use AICc as the default best model if available
+                best_model = models["AICc"] or models["AIC"] or models["BIC"]
+                if best_model:
+                    logger.info(f"Selected best model: {best_model} (AICc preferred)")
+                    
+                    # Return all models and the selected best
+                    return {
+                        "best": best_model,
+                        "BIC": models["BIC"],
+                        "AIC": models["AIC"],
+                        "AICc": models["AICc"]
+                    }
+                else:
+                    logger.warning("Could not find any best model in ModelTest-NG output")
+                    # If output files exist but we couldn't parse them, do a more drastic approach - grep the files
+                    if os.path.exists(output_file):
+                        logger.info("Attempting direct grep-like extraction from output file")
+                        try:
+                            # Use subprocess from main imports - it's already imported at top of file
+                            for criterion in ["BIC", "AIC", "AICc"]:
+                                cmd = ["grep", "-A", "3", f"Best model according to {criterion}", output_file]
+                                result = subprocess.run(cmd, capture_output=True, text=True)
+                                if result.returncode == 0 and result.stdout:
+                                    logger.info(f"Grep result for {criterion}: {result.stdout}")
+                                    lines = result.stdout.strip().split('\n')
+                                    for i, line in enumerate(lines):
+                                        # Parse output that looks like:
+                                        # Best model according to BIC
+                                        # ---------------------------
+                                        # Model:              TIM2+G4
+                                        if line.strip().startswith("Best model according to") and i+2 < len(lines):
+                                            # Model line should be 2 lines down (after separator line)
+                                            model_line = lines[i+2].strip()
+                                            if model_line.startswith("Model:"):
+                                                model_value = model_line.split(":", 1)[1].strip()
+                                                models[criterion] = model_value
+                                                logger.info(f"Grep found {criterion} model: {model_value}")
+                                                break
+                            
+                            # Check if we found any models using grep
+                            best_model = models["AICc"] or models["AIC"] or models["BIC"]
+                            if best_model:
+                                logger.info(f"Grep extraction found models: {models}")
+                                return {
+                                    "best": best_model,
+                                    "BIC": models["BIC"],
+                                    "AIC": models["AIC"],
+                                    "AICc": models["AICc"]
+                                }
+                        except Exception as grep_error:
+                            logger.error(f"Error in grep extraction: {grep_error}")
+                            
+                    return None
+                
+            except Exception as e:
+                logger.error(f"Error parsing ModelTest-NG output: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
+                
+            # If we couldn't parse any models, return None
+            return None
+        else:
+            stderr = process.stderr.read() if process.stderr else ""
+            logger.error(f"ModelTest-NG failed with return code {process.returncode}: {stderr}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error running ModelTest-NG: {str(e)}")
+        return None
+
+def run_iqtree_modeltest(input_path, output_path=None, progress=None):
+    """Run IQ-TREE to find the best evolutionary model
+    
+    Args:
+        input_path: Path to the input alignment file
+        output_path: Path to write the model output (optional)
+        progress: Optional progress dialog to update
+        
+    Returns:
+        Best model name as string or None if it failed
+    """
+    # Try the hardcoded path first since we know it works
+    iqtree_path = "/home/alan/anaconda3/bin/iqtree"
+    
+    # Check if the hardcoded path exists and is executable
+    if not os.path.isfile(iqtree_path) or not os.access(iqtree_path, os.X_OK):
+        # Fall back to the normal search method
+        logger.info("Hardcoded IQ-TREE path not found, using normal search")
+        iqtree_path = find_external_tool("iqtree")
+    
+    if not iqtree_path:
+        logger.error("IQ-TREE not found")
+        QMessageBox.warning(None, "Tool Not Found", 
+                           "IQ-TREE was not found in your PATH. Please install IQ-TREE or add it to your PATH.")
+        return None
+    
+    # IQ-TREE creates its own output files with extensions
+    output_prefix = input_path
+    if output_path:
+        output_prefix = output_path
+    
+    # Run IQ-TREE with model finding only
+    # Command format: iqtree -s input.fasta -m MF -nt auto -pre output
+    iqtree_cmd = [
+        iqtree_path,
+        "-s", input_path,
+        "-m", "MF",  # Model Finder
+        "-nt", "auto",  # Auto-detect number of threads
+        "-pre", output_prefix
+    ]
+    
+    try:
+        logger.info(f"Running IQ-TREE model finder: {' '.join(iqtree_cmd)}")
+        
+        # Log the command in a format that can be copy/pasted into a terminal
+        terminal_cmd = ' '.join([str(arg) for arg in iqtree_cmd])
+        logger.info(f"Terminal-friendly command: {terminal_cmd}")
+        
+        # Try using a direct call first with the full path
+        # This is most reliable on Linux/macOS systems
+        logger.info("Running IQ-TREE via subprocess directly")
+        
+        # Create file to log command output 
+        log_file_path = f"{output_prefix}.iqtree.direct.log"
+        with open(log_file_path, 'w') as log_file:
+            log_file.write(f"IQ-TREE Command: {terminal_cmd}\n\n")
+            log_file.write(f"BEGINNING DIRECT EXECUTION LOG\n")
+            log_file.write(f"===============================\n\n")
+        
+        # Start the process and give it time to complete
+        # Use a direct call approach that ensures we invoke the correct binary
+        process = subprocess.Popen(
+            iqtree_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=False,  # Explicitly set to False for clarity
+            cwd=os.path.dirname(input_path)  # Run in the directory where the input file is
+        )
+        
+        # Monitor process - IQ-TREE may take several minutes for model finding
+        # Progress updates are handled by the calling function via a timer
+        if progress:
+            # Monitor the process while capturing output for logging
+            stdout_data = []
+            stderr_data = []
+            
+            while process.poll() is None:
+                # Read from stdout and stderr without blocking
+                if process.stdout:
+                    for line in iter(process.stdout.readline, ''):
+                        if not line:
+                            break
+                        stdout_data.append(line.strip())
+                        logger.debug(f"IQ-TREE stdout: {line.strip()}")
+                        # Also append to our direct log file
+                        with open(log_file_path, 'a') as log_file:
+                            log_file.write(f"STDOUT: {line}")
+                
+                if process.stderr:
+                    for line in iter(process.stderr.readline, ''):
+                        if not line:
+                            break
+                        stderr_data.append(line.strip())
+                        logger.debug(f"IQ-TREE stderr: {line.strip()}")
+                        # Also append to our direct log file
+                        with open(log_file_path, 'a') as log_file:
+                            log_file.write(f"STDERR: {line}")
+                
+                # Check for cancellation
+                QApplication.processEvents()
+                if hasattr(progress, 'wasCanceled') and progress.wasCanceled():
+                    process.terminate()
+                    logger.warning("IQ-TREE process canceled by user")
+                    return None
+                    
+                # Sleep between checks to reduce CPU usage
+                time.sleep(0.2)
+            
+            # Read any remaining output
+            if process.stdout:
+                for line in process.stdout:
+                    stdout_data.append(line.strip())
+                    logger.debug(f"IQ-TREE final stdout: {line.strip()}")
+                    with open(log_file_path, 'a') as log_file:
+                        log_file.write(f"FINAL STDOUT: {line}")
+                        
+            if process.stderr:
+                for line in process.stderr:
+                    stderr_data.append(line.strip())
+                    logger.debug(f"IQ-TREE final stderr: {line.strip()}")
+                    with open(log_file_path, 'a') as log_file:
+                        log_file.write(f"FINAL STDERR: {line}")
+            
+            # Final progress update
+            if hasattr(progress, 'setValue'):
+                progress.setValue(90)
+        else:
+            # For non-interactive use, still capture output for logging
+            stdout, stderr = process.communicate()
+            
+            # Log the output
+            with open(log_file_path, 'a') as log_file:
+                log_file.write("\n\nSTDOUT:\n")
+                log_file.write(stdout)
+                log_file.write("\n\nSTDERR:\n")
+                log_file.write(stderr)
+                
+            logger.debug(f"IQ-TREE stdout: {stdout}")
+            logger.debug(f"IQ-TREE stderr: {stderr}")
+        
+        # Check if IQ-TREE succeeded
+        model_file = f"{output_prefix}.model.gz"
+        log_file = f"{output_prefix}.log"
+        
+        if process.returncode == 0 and (os.path.exists(model_file) or os.path.exists(log_file)):
+            logger.info("IQ-TREE model finder completed successfully")
+            
+            # Parse the log file to find the best model - Try multiple approaches
+            best_model = None
+            try:
+                # First, try all common log files IQ-TREE might create
+                log_files_to_try = [
+                    log_file,                              # Primary log file
+                    f"{output_prefix}.iqtree",            # IQ-TREE output file
+                    f"{output_prefix}.iqtree.log",        # Alternative log location
+                    f"{input_path}.iqtree"                # Another common location
+                ]
+                
+                for log_file_path in log_files_to_try:
+                    if os.path.exists(log_file_path):
+                        logger.info(f"Checking log file for model info: {log_file_path}")
+                        with open(log_file_path, 'r') as f:
+                            content = f.read()
+                            
+                            # Add debugging output to see the actual content
+                            logger.debug(f"Log file snippet (first 1000 chars): {content[:1000]}...")
+                            
+                            # Look for the best model line - multiple possible formats
+                            model_patterns = [
+                                "Best-fit model according to BIC:",
+                                "Best-fit model: ",
+                                "Best-fit model chosen",
+                                "ModelFinder",
+                                "BEST SCORE"
+                            ]
+                            
+                            for pattern in model_patterns:
+                                model_start = content.find(pattern)
+                                if model_start != -1:
+                                    # Get the line containing the pattern
+                                    lines = content[model_start:].splitlines()
+                                    if not lines:
+                                        continue
+                                        
+                                    model_line = lines[0]
+                                    logger.info(f"Found potential model line: {model_line}")
+                                    
+                                    # Extract the model name based on the pattern
+                                    if "Best-fit model: " in model_line:
+                                        # Format: "Best-fit model: TIM2+F+G4 chosen according to BIC"
+                                        model_parts = model_line.split("Best-fit model: ", 1)[1]
+                                        if " chosen according to" in model_parts:
+                                            best_model = model_parts.split(" chosen according to")[0].strip()
+                                        else:
+                                            best_model = model_parts.strip()
+                                    elif ":" in model_line:
+                                        # Standard format with colon
+                                        parts = model_line.split(":", 1)
+                                        if len(parts) > 1:
+                                            best_model = parts[1].strip()
+                                    
+                                    if best_model:
+                                        logger.info(f"Best model found: {best_model}")
+                                        break
+                                
+                            # Check nearby lines if the exact pattern wasn't found
+                            if not best_model:
+                                # Look for lines containing model names
+                                model_keywords = ["GTR", "JC", "HKY", "TIM", "TPM", "TVM", "SYM", "K80", "+F", "+G", "+I", "+R"]
+                                
+                                for line in content.splitlines():
+                                    if any(keyword in line for keyword in model_keywords) and ("BIC" in line or "best" in line.lower()):
+                                        logger.info(f"Found potential model line with keywords: {line}")
+                                        # Try to extract model name using regex 
+                                        import re
+                                        model_match = re.search(r'(TPM\w*\+F\+R\d|[A-Z0-9]+\+[A-Z0-9+]+)', line)
+                                        if model_match:
+                                            best_model = model_match.group(0)
+                                            logger.info(f"Extracted model with regex: {best_model}")
+                                            break
+                            
+                            if best_model:
+                                break  # Found in this log file, no need to check others
+                
+                # Check specifically for the exact format you found in the file
+                if not best_model and process.returncode == 0:
+                    # Try one more time with a more direct approach - search all log files again
+                    for log_file_path in log_files_to_try:
+                        if os.path.exists(log_file_path):
+                            try:
+                                # Run grep-like search for the specific line format
+                                with open(log_file_path, 'r') as f:
+                                    for line in f:
+                                        if "Best-fit model according to BIC:" in line:
+                                            # Extract model from this exact format
+                                            model_text = line.split("Best-fit model according to BIC:", 1)[1].strip()
+                                            logger.info(f"Found exact BIC model line: '{line.strip()}'")
+                                            logger.info(f"Extracted model: '{model_text}'")
+                                            best_model = model_text
+                                            break
+                                if best_model:
+                                    break
+                            except Exception as e:
+                                logger.error(f"Error in final model search: {e}")
+                
+                # Always save the best model to a file even if we couldn't find it
+                best_model_file = f"{output_prefix}.bestmodel.txt"
+                try:
+                    with open(best_model_file, 'w') as f:
+                        if best_model:
+                            f.write(f"Best model found by IQ-TREE: {best_model}\n")
+                        else:
+                            f.write("Could not automatically determine best model.\n")
+                            f.write("Please check the IQ-TREE output file and look for line containing:\n")
+                            f.write("  'Best-fit model according to BIC:'\n")
+                            # Include paths to look at
+                            f.write("\nCheck these files:\n")
+                            for log_path in log_files_to_try:
+                                f.write(f"- {log_path}\n")
+                except Exception as e:
+                    logger.error(f"Error writing best model file: {e}")
+                
+                # If we still don't have a model but the program ran successfully,
+                # use a sensible default rather than failing
+                if not best_model and process.returncode == 0:
+                    logger.warning("Could not parse model from log files, using default GTR+F+G model")
+                    best_model = "GTR+F+G"
+            except Exception as e:
+                logger.error(f"Error parsing IQ-TREE output: {str(e)}")
+                
+            return best_model
+        else:
+            stderr = process.stderr.read() if process.stderr else ""
+            logger.error(f"IQ-TREE failed with return code {process.returncode}: {stderr}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error running IQ-TREE: {str(e)}")
+        return None
+
+def run_raxml(working_dir, alignment_file, params=None, progress=None):
+    """Run RAxML for tree construction with advanced options
+    
+    Args:
+        working_dir: Directory to run RAxML in
+        alignment_file: Path to the alignment file
+        params: Dictionary of parameters for RAxML
+        progress: Progress dialog to update
+        
+    Returns:
+        Dictionary with additional information about the run:
+        - sequence_name_map: Mapping of modified sequence names to original names
+        - trim_stats: Statistics from alignment trimming if performed
+        - command: The actual command line used to run RAxML
+    """
+    # Set up logging
+    logger = logging.getLogger("treecraft.utils.external_tools")
+    
+    # Add detailed diagnostic information at the start
+    logger.info("=" * 80)
+    logger.info("STARTING RAxML TREE BUILDING")
+    logger.info(f"Input working directory: {working_dir}")
+    logger.info(f"Input alignment file: {alignment_file}")
+    
+    # Check if the alignment file exists and is readable
+    if not os.path.exists(alignment_file):
+        logger.error(f"ERROR: Alignment file does not exist: {alignment_file}")
+        return False
+    
+    # Check the content of the alignment file (first few lines)
+    try:
+        with open(alignment_file, 'r') as f:
+            first_lines = [f.readline() for _ in range(10)]
+        logger.info(f"First 10 lines of alignment file:\n{'-' * 40}\n{''.join(first_lines)}\n{'-' * 40}")
+    except Exception as e:
+        logger.error(f"Error reading alignment file: {e}")
+    
+    # Create a result info dictionary
+    result_info = {
+        "sequence_name_map": {},  # Will store mapping of names with underscores to original names
+        "trim_stats": {}          # Will store trimming statistics if applicable
+    }
+    # DIAGNOSTIC: Check for raxml-ng specifically and run version check
+    try:
+        logger.info("DIAGNOSTIC: Checking for raxml-ng executable")
+        
+        # First, look for raxml-ng in PATH directly with a hard-coded path
+        potential_paths = [
+            "/usr/bin/raxml-ng", 
+            "/usr/local/bin/raxml-ng",
+            "/opt/homebrew/bin/raxml-ng",  # For Mac
+            os.path.join(os.getcwd(), "raxml-ng"),  # Current directory
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "raxml-ng")  # App directory
+        ]
+        
+        raxml_ng_path = None
+        for path in potential_paths:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                raxml_ng_path = path
+                logger.info(f"DIAGNOSTIC: Found raxml-ng at hard-coded path: {path}")
+                break
+        
+        # If not found with hard-coded paths, try using which
+        if not raxml_ng_path:
+            try:
+                result = subprocess.run(["which", "raxml-ng"], 
+                                      stdout=subprocess.PIPE, 
+                                      stderr=subprocess.PIPE,
+                                      text=True)
+                if result.returncode == 0:
+                    raxml_ng_path = result.stdout.strip()
+                    logger.info(f"DIAGNOSTIC: raxml-ng found at: {raxml_ng_path}")
+            except:
+                pass
+        
+        # If found, test it directly
+        if raxml_ng_path:
+            try:
+                # Now try to run raxml-ng --version
+                version_result = subprocess.run([raxml_ng_path, "--version"],
+                                               stdout=subprocess.PIPE,
+                                               stderr=subprocess.PIPE,
+                                               text=True)
+                logger.info(f"DIAGNOSTIC: raxml-ng version check return code: {version_result.returncode}")
+                logger.info(f"DIAGNOSTIC: raxml-ng version check stdout: {version_result.stdout[:200]}")
+                logger.info(f"DIAGNOSTIC: raxml-ng version check stderr: {version_result.stderr[:200]}")
+                
+                # If version check succeeded, use this path directly
+                if version_result.returncode == 0:
+                    logger.info(f"DIAGNOSTIC: Will use directly tested raxml-ng path: {raxml_ng_path}")
+                    # Force the path
+                    params = params or {}
+                    params["raxml_binary"] = "raxml-ng"
+                    params["raxml_direct_path"] = raxml_ng_path
+            except Exception as e:
+                logger.error(f"DIAGNOSTIC: Error running raxml-ng version test: {e}")
+        else:
+            logger.warning("DIAGNOSTIC: raxml-ng not found in standard locations")
+    except Exception as e:
+        logger.error(f"DIAGNOSTIC: Error in raxml-ng direct check: {e}")
+        
+    # Also check with our find_external_tool function
+    diag_path = find_external_tool("raxml-ng")
+    if diag_path:
+        logger.info(f"DIAGNOSTIC: find_external_tool found raxml-ng at: {diag_path}")
+    else:
+        logger.warning("DIAGNOSTIC: find_external_tool could not find raxml-ng")
+    # Default parameters if none provided
+    if params is None:
+        params = {
+            "model": "GTR+GAMMA",
+            "bootstrap": False,
+            "bootstrap_replicates": 100,
+            "raxml_binary": "auto",
+            "threads": 8,  # Increased from 4 to 8 threads
+            "seed": 12345
+        }
+    
+    # Create a fallback binary in the working directory if it doesn't exist yet
+    # This is a simple shell script that shows an error message
+    fallback_script = os.path.join(working_dir, "raxml-error.sh")
+    with open(fallback_script, "w") as f:
+        f.write("#!/bin/sh\n")
+        f.write("echo \"ERROR: RAxML binary not found in your system.\"\n")
+        f.write("echo \"Please install RAxML-NG or standard RAxML.\"\n")
+        f.write("echo \"Visit: https://github.com/amkozlov/raxml-ng or https://github.com/stamatak/standard-RAxML\"\n")
+        f.write("exit 1\n")
+    
+    # Make the script executable
+    os.chmod(fallback_script, 0o755)
+    
+    # Find the appropriate RAxML binary
+    raxml_path = None
+    
+    # First check if we have a direct path from the diagnostic test
+    if "raxml_direct_path" in params and os.path.isfile(params["raxml_direct_path"]):
+        raxml_path = params["raxml_direct_path"]
+        logger.info(f"Using direct RAxML path: {raxml_path}")
+    else:
+        # Use normal path lookup
+        binary_type = params.get("raxml_binary", "auto")
+        
+        if binary_type == "auto":
+            # Try raxml-ng first, then fallback to others
+            raxml_path = find_external_tool("raxml-ng")
+            if not raxml_path:
+                raxml_path = find_external_tool("raxml-pthreads")
+                if not raxml_path:
+                    raxml_path = find_external_tool("raxml-std")
+                    if not raxml_path:
+                        logger.error("No RAxML binary found in PATH, using fallback script")
+                        QMessageBox.critical(None, "RAxML Not Found", 
+                                          "No RAxML binary found in your PATH. Please install RAxML-NG or RAxML and make sure it's in your PATH.")
+                        # Use the fallback script to produce a clear error
+                        raxml_path = fallback_script
+        else:
+            # User specified a specific binary type
+            raxml_path = find_external_tool(binary_type)
+            if not raxml_path:
+                logger.error(f"Specified RAxML binary '{binary_type}' not found, using fallback script")
+                QMessageBox.critical(None, "RAxML Not Found", 
+                                   f"The specified RAxML binary '{binary_type}' was not found in your PATH.")
+                # Use the fallback script to produce a clear error
+                raxml_path = fallback_script
+    
+    logger.info(f"Using RAxML binary: {raxml_path}")
+    
+    # Determine if we're using raxml-ng or standard raxml or our fallback script
+    is_raxml_ng = "raxml-ng" in raxml_path if raxml_path else False
+    is_fallback = "raxml-error.sh" in raxml_path if raxml_path else True
+    
+    # Log very clearly what binary we're using
+    logger.info(f"RAxML binary decision: Path={raxml_path}, is_raxml_ng={is_raxml_ng}, is_fallback={is_fallback}, binary_type={params.get('raxml_binary')}")
+    
+    # Set up common parameters
+    model = params.get("model", "GTR+GAMMA")
+    
+    # Handle model compatibility between raxml-ng and standard raxml
+    if is_raxml_ng:
+        # RaxML-NG: make sure model name has correct format
+        # Map common models to their correct RaxML-NG form
+        model_map = {
+            "GTRGAMMA": "GTR+G",
+            "GTRCAT": "GTR+R",
+            "GTRCATI": "GTR+R+I",
+            "GTRGAMMAI": "GTR+G+I",
+            "GTR": "GTR",
+            "JC69": "JC",
+            "JC69GAMMA": "JC+G",
+            "HKY85": "HKY",
+            "HKY85GAMMA": "HKY+G",
+            # Handle common cases of model names
+            "GTR+GAMMA": "GTR+G",
+            "GTR+G": "GTR+G",
+            "GTR+CAT": "GTR+R",
+            "GTR+R": "GTR+R",
+            "JC+GAMMA": "JC+G",
+            "HKY+GAMMA": "HKY+G",
+            "GTR+GAMMA+I": "GTR+G+I",
+            "GTR+G+I": "GTR+G+I",
+            "RGAMMA": "GTR+G",  # Special case for the problematic model
+            "GAMMA": "GTR+G"    # Default to GTR+G if just GAMMA is specified
+        }
+        
+        # If the model is in our map, use the mapped version
+        if model in model_map:
+            model = model_map[model]
+        # Otherwise ensure it has proper spacing for RaxML-NG
+        elif "+" not in model and "GAMMA" in model:
+            model = model.replace("GAMMA", "+G")
+        # Handle cases where model might be specified incorrectly
+        elif "GAMMA" in model and "GTR" not in model and "JC" not in model and "HKY" not in model:
+            # Add GTR prefix if missing (e.g., "RGAMMA" -> "GTR+G")
+            model = "GTR+G"
+        
+        # Final validation - always ensure the model has a valid format
+        # Check that the model follows the pattern NAME+RATEHET
+        if "+" not in model and model not in ["GTR", "JC", "HKY"]:
+            # This means there's no valid rate heterogeneity - default to GTR+G
+            logger.warning(f"Invalid model format for RaxML-NG: {model}, defaulting to GTR+G")
+            model = "GTR+G"
+            
+    elif not is_fallback:
+        # Standard RaxML: convert to standard format
+        # Remove + signs and ensure proper names
+        standard_model_map = {
+            "GTR+G": "GTRGAMMA", 
+            "GTR+GAMMA": "GTRGAMMA",
+            "GTR+R": "GTRCAT",
+            "GTR+CAT": "GTRCAT",
+            "GTR+G+I": "GTRGAMMAI",
+            "GTR+GAMMA+I": "GTRGAMMAI",
+            "GTR+R+I": "GTRCATI",
+            "GTR+CAT+I": "GTRCATI",
+            "JC+G": "JC69GAMMA",
+            "JC+GAMMA": "JC69GAMMA",
+            "HKY+G": "HKY85GAMMA",
+            "HKY+GAMMA": "HKY85GAMMA",
+        }
+        
+        # Check if model is in the map first
+        if model in standard_model_map:
+            model = standard_model_map[model]
+        else:
+            # Otherwise do general conversion
+            model = model.replace("+", "")
+            # Check if model contains just "G" as shorthand for GAMMA
+            if "G" in model and "GAMMA" not in model:
+                model = model.replace("G", "GAMMA")
+        
+        # Make sure model is one of the supported ones
+        if not any(x in model for x in ["GTR", "JC69", "HKY85", "WAG", "DAYHOFF", "BLOSUM"]):
+            logger.warning(f"Invalid model format for standard RaxML: {model}, defaulting to GTRGAMMA")
+            model = "GTRGAMMA"  # Default fallback
+    
+    # Log the final model decision
+    original_model = params.get("model", "GTR+GAMMA")
+    if original_model != model:
+        logger.info(f"Converting model from '{original_model}' to '{model}' for {'RaxML-NG' if is_raxml_ng else 'standard RaxML'}")
+    else:
+        logger.info(f"Using model: {model} for {'RaxML-NG' if is_raxml_ng else 'standard RaxML'}")
+    
+    threads = params.get("threads", 4)
+    seed = params.get("seed", 12345)
+    do_bootstrap = params.get("bootstrap", False)
+    bootstrap_reps = params.get("bootstrap_replicates", 100)
+    
+    # Set up command based on which RAxML version we're using
+    if is_fallback:
+        # Use our fallback script - it will just show an error message
+        raxml_cmd = [raxml_path]
+    elif is_raxml_ng:
+        # Check if we have a cleaned alignment file path
+        actual_alignment = processed_alignment if 'processed_alignment' in locals() else alignment_file
+        logger.info(f"RAxML-NG will use alignment file: {actual_alignment}")
+        
+        # RAxML-NG command format
+        raxml_cmd = [
+            raxml_path,
+            "--msa", actual_alignment,
+            "--model", model,
+            "--prefix", "result"
+        ]
+        
+        # Add seed and threads as separate arguments to avoid issues
+        raxml_cmd.extend(["--seed", str(seed)])
+        raxml_cmd.extend(["--threads", str(threads)])
+        
+        # Add bootstrap if requested - use correct command for RAxML-NG
+        if do_bootstrap:
+            # For RAxML-NG, we need to use --all to perform both ML tree inference and bootstrapping
+            raxml_cmd.extend(["--all"])
+            raxml_cmd.extend(["--bs-trees", str(bootstrap_reps)])
+        
+        # Add partition options if requested
+        if params.get("partition_codons", False):
+            # Create a partition file
+            partition_file = os.path.join(working_dir, "partitions.txt")
+            with open(partition_file, "w") as f:
+                f.write("DNA, p1=1-./3\n")
+                f.write("DNA, p2=2-./3\n")
+                f.write("DNA, p3=3-./3\n")
+            raxml_cmd.extend(["--partition", partition_file])
+        
+        # Add outgroup if specified
+        if params.get("outgroup", ""):
+            raxml_cmd.extend(["--outgroup", params["outgroup"]])
+        
+        # Add ascertainment bias correction if requested
+        if params.get("ascertainment_bias", False):
+            raxml_cmd.append("--asc-corr=lewis")
+        
+        # Add additional args if provided
+        if params.get("additional_args", ""):
+            raxml_cmd.extend(params["additional_args"].split())
+    else:
+        # Check if we have a cleaned alignment file path
+        actual_alignment = processed_alignment if 'processed_alignment' in locals() else alignment_file
+        logger.info(f"Standard RAxML will use alignment file: {actual_alignment}")
+        
+        # Standard RaxML command format
+        raxml_cmd = [
+            raxml_path,
+            "-s", actual_alignment,
+            "-n", "result",
+            "-m", model,  # Model already processed above
+            "-p", str(seed)
+        ]
+        
+        # Add bootstrap if requested
+        if do_bootstrap:
+            # For standard RAxML, add bootstrap parameters and ensure the tree is written with support values
+            raxml_cmd.extend(["-#", str(bootstrap_reps), "-b", str(seed), "-f", "b"])
+        
+        # Add multithreading if available (PTHREADS version)
+        if "PTHREADS" in raxml_path or "MPI" in raxml_path or "SSE3" in raxml_path or "AVX" in raxml_path:
+            raxml_cmd.extend(["-T", str(threads)])
+        
+        # Add outgroup if specified
+        if params.get("outgroup", ""):
+            raxml_cmd.extend(["-o", params["outgroup"]])
+        
+        # Add additional args if provided
+        if params.get("additional_args", ""):
+            raxml_cmd.extend(params["additional_args"].split())
+    
+    # Validate the alignment file exists
+    if not os.path.exists(alignment_file):
+        logger.error(f"Alignment file not found: {alignment_file}")
+        QMessageBox.critical(None, "Error", f"Alignment file not found: {alignment_file}")
+        return False
+        
+    # Check if the alignment file is empty
+    if os.path.getsize(alignment_file) == 0:
+        logger.error(f"Alignment file is empty: {alignment_file}")
+        QMessageBox.critical(None, "Error", f"Alignment file is empty: {alignment_file}")
+        return False
+        
+    # Process the alignment file to ensure it only has valid characters
+    # RaxML-NG can be picky about characters in the alignment
+    try:
+        # Create a processed alignment file
+        processed_alignment = alignment_file + ".clean"
+        logger.info("Starting to process alignment file for RAxML")
+        
+        # First check if the file is valid FASTA
+        with open(alignment_file, 'r') as f:
+            lines = f.readlines()
+            
+        # Remove any leading/trailing whitespace from all lines
+        lines = [line.strip() for line in lines]
+        
+        # Replace spaces in sequence names with underscores and build mapping
+        name_map = {}  # To keep track of modified names
+        modified_lines = []
+        in_header = False
+        current_header = ""
+        
+        for line in lines:
+            if line.startswith('>'):
+                in_header = True
+                original_header = line[1:]  # Remove '>' character
+                # Replace spaces with underscores in the header
+                modified_header = original_header.replace(' ', '_')
+                # Store mapping, but avoid duplicates that might cause issues
+                # Only store if this modified header isn't already mapped to something else
+                if modified_header not in name_map:
+                    name_map[modified_header] = original_header
+                
+                # Also store first part (before first space) mapping
+                # This helps when RaxML truncates names after the first space
+                if ' ' in original_header:
+                    first_part = original_header.split(' ')[0]
+                    first_part_with_underscores = first_part.replace(' ', '_')
+                    
+                    # Only add if these keys don't already exist
+                    if first_part not in name_map:
+                        name_map[first_part] = original_header
+                    
+                    if first_part_with_underscores not in name_map:
+                        name_map[first_part_with_underscores] = original_header
+                # Add to modified lines
+                modified_lines.append('>' + modified_header)
+                # Store current header for logging
+                current_header = modified_header
+            else:
+                in_header = False
+                modified_lines.append(line)
+        
+        # Update lines with modified ones
+        lines = modified_lines
+        
+        # Create completely safe sequence names for RAxML-NG
+        # Use simple "seq1", "seq2", etc. format to guarantee Newick compatibility
+        safe_lines = []
+        original_headers = []  # Keep track of original headers in the same order
+        
+        seq_counter = 1
+        for line in lines:
+            if line.startswith('>'):
+                header = line[1:]  # Remove '>' character
+                original_headers.append(header)
+                
+                # Generate a completely safe name
+                safe_header = f"seq{seq_counter}"
+                seq_counter += 1
+                
+                # Add to the name mapping
+                name_map[safe_header] = header
+                
+                safe_lines.append('>' + safe_header)
+            else:
+                safe_lines.append(line)
+        
+        # Update lines with completely safe names
+        lines = safe_lines
+        
+        # Log what we've done
+        logger.info(f"Replaced all sequence names with safe identifiers (seq1, seq2, etc.)")
+                
+        # Store the name mapping for use later
+        result_info["sequence_name_map"] = name_map
+        logger.info(f"Created mapping for {len(name_map)} sequence names with spaces and special characters")
+        
+        # Log a sample of the name mappings for debugging
+        map_items = list(name_map.items())
+        for i in range(min(5, len(map_items))):
+            logger.info(f"Name mapping sample {i+1}: {map_items[i][0]} -> {map_items[i][1]}")
+        
+        # Make sure the file starts with a header (>)
+        if not lines[0].startswith('>'):
+            logger.error("Alignment file doesn't start with FASTA header (>)")
+            QMessageBox.critical(None, "Format Error", 
+                                "The alignment file doesn't appear to be in FASTA format. It should start with '>'.")
+            return False
+            
+        # At this point, lines should have our safe seq1, seq2, etc. names
+        # Create a direct mapping file from the current state to the desired clean state
+        import tempfile
+        
+        # Create a temporary directory for RAxML input
+        raxml_temp_dir = tempfile.mkdtemp(prefix="raxml_", dir="/tmp")
+        logger.info(f"Created RAxML temp directory: {raxml_temp_dir}")
+        
+        # Write a new clean FASTA file with seq1, seq2, etc. names to the temp directory
+        # Use a very simple filename to avoid any potential issues with paths
+        clean_fasta_path = os.path.join(raxml_temp_dir, "alignment.fasta")
+        
+        # Create completely clean name mapping
+        clean_name_map = {}  # This will store seq1->original name mapping
+        
+        # Keep track of original headers for debugging
+        original_headers = [] 
+        
+        seq_counter = 1
+        with open(clean_fasta_path, "w") as clean_f:
+            # First pass - create a new FASTA with simple seq1, seq2, etc. names
+            current_seq = ""
+            for line in lines:
+                if line.startswith(">"):
+                    # Get the header without the '>'
+                    header = line[1:].strip()
+                    
+                    # Check if we're already dealing with a sanitized seq ID
+                    import re
+                    is_already_sanitized = bool(re.match(r'^seq\d+$', header))
+                    
+                    # Get the actual original header - this is key
+                    if is_already_sanitized and header in name_map:
+                        # We've already sanitized this - use the stored original header from previous mapping
+                        original_header = name_map[header]
+                        logger.info(f"Found previously sanitized header: {header} -> {original_header}")
+                    else:
+                        # This is a normal header or hasn't been seen before
+                        original_header = header
+                        
+                    # Make sure we have the full header/description, not just the ID
+                    # This is critical for proper display of sequence names in the tree
+                    # Check if original_header appears to be just an ID (no spaces or description)
+                    if ' ' not in original_header and original_header in name_map:
+                        # It might be just an ID that we've previously mapped to a full description
+                        full_header = name_map.get(original_header)
+                        if full_header and ' ' in full_header:
+                            logger.info(f"Using full header description instead of just ID: {original_header} -> {full_header}")
+                            original_header = full_header
+                    
+                    # For debugging
+                    original_headers.append(original_header)
+                    
+                    # Create a simple sanitized seq ID (numbered sequentially)
+                    seq_id = f"seq{seq_counter}"
+                    
+                    # Store mapping from sanitized ID directly to original header
+                    # (NOT to the potentially already-sanitized header)
+                    clean_name_map[seq_id] = original_header
+                    
+                    # Also store in the main name_map, always linking to original header
+                    name_map[seq_id] = original_header
+                    
+                    logger.info(f"Setting name map: {seq_id} -> {original_header}")
+                    
+                    seq_counter += 1
+                    
+                    # Write the sanitized header
+                    clean_f.write(f">{seq_id}\n")
+                else:
+                    # Clean and write the sequence data
+                    valid_chars = set("ACGTNacgtn-")
+                    clean_seq = ''.join(c if c in valid_chars else 'N' for c in line)
+                    clean_f.write(f"{clean_seq}\n")
+            
+            # After writing, log the originals we found
+            logger.info(f"Original headers: {original_headers[:10]} (showing first 10)")
+            
+        # Log the clean name mapping to verify correct mapping
+        logger.info(f"CRITICAL: Created clean name map with {len(clean_name_map)} entries")
+        for seq_id, original_name in list(clean_name_map.items())[:5]:  # Show first 5 entries
+            logger.info(f"  Clean Map: {seq_id} -> {original_name}")
+        
+        # Update our path to the clean file we just created
+        processed_alignment = clean_fasta_path
+        
+        # Update working directory in result_info for later use
+        result_info["raxml_working_dir"] = raxml_temp_dir
+        
+        # Store the name map in the result_info - this is CRITICAL for name restoration
+        result_info["sequence_name_map"] = name_map
+        
+        # Log all entries in the name map for debugging
+        logger.info(f"CRITICAL: Created name map with {len(name_map)} entries")
+        for seq_id, original_name in list(name_map.items())[:10]:  # Show first 10 entries
+            logger.info(f"  {seq_id} -> {original_name}")
+        
+        # Log key information
+        logger.info(f"CRITICAL: Setting alignment_file to {processed_alignment}")
+        logger.info(f"CRITICAL: Setting raxml_working_dir to {raxml_temp_dir}")
+                    
+        # Always use the cleaned alignment 
+        logger.info("Created cleaned alignment for RAxML")
+        alignment_file = processed_alignment
+        
+        # Also update the working directory where RAxML will be run
+        working_dir = raxml_temp_dir
+        logger.info(f"CRITICAL: Updated RAxML working directory to: {working_dir}")
+        
+        # Double-check the cleaned file with BioPython
+        from Bio import SeqIO
+        try:
+            records = list(SeqIO.parse(alignment_file, "fasta"))
+            logger.info(f"Cleaned alignment contains {len(records)} sequences")
+            
+            if len(records) < 3:
+                logger.error("RAxML requires at least 3 sequences")
+                QMessageBox.critical(None, "Error", 
+                                    "RAxML requires at least 3 sequences to build a tree. Your alignment has fewer sequences.")
+                return False
+                
+            # Display alignment details
+            for i, record in enumerate(records[:5]):  # Show first 5 only
+                logger.info(f"Sequence {i+1}: {record.id}, length: {len(record.seq)}")
+            
+            # DIAGNOSTIC: Validate that sequence names are sanitized for Newick compatibility
+            has_invalid_names = False
+            for record in records:
+                # Check for problematic characters in sequence IDs
+                if any(c in record.id for c in "():;,[]' \""):
+                    logger.error(f"VALIDATION ERROR: Sequence {record.id} contains characters invalid for Newick format")
+                    has_invalid_names = True
+            
+            if has_invalid_names:
+                logger.error("Some sequence names still contain invalid characters. Sanitization may have failed.")
+            else:
+                logger.info("VALIDATION PASSED: All sequence names are properly sanitized")
+            
+            # Check for sequence lengths
+            lengths = [len(record.seq) for record in records]
+            if len(set(lengths)) > 1:
+                logger.warning(f"Sequences have different lengths: {lengths}")
+                QMessageBox.warning(None, "Warning", 
+                                  f"Sequences in your alignment have different lengths ({min(lengths)}-{max(lengths)}). " +
+                                  "This might cause problems with RAxML.")
+        except Exception as e:
+            logger.error(f"Error checking cleaned alignment: {e}")
+            
+    except Exception as e:
+        logger.error(f"Error cleaning alignment: {e}")
+        QMessageBox.critical(None, "Error", 
+                           f"Failed to clean alignment file: {str(e)}")
+        return False  # Don't continue with the original file, it will definitely fail
+        
+    # Try to log the first few lines of the alignment file
+    try:
+        with open(alignment_file, 'r') as f:
+            content = f.read(1000)  # Read first 1000 chars
+            logger.debug(f"Alignment file content preview: \n{content}")
+    except Exception as e:
+        logger.error(f"Error reading alignment file: {e}")
+        
+    # Check if alignment file looks like FASTA
+    try:
+        with open(alignment_file, 'r') as f:
+            first_line = f.readline().strip()
+            if not first_line.startswith('>'):
+                logger.warning(f"Alignment file doesn't appear to be in FASTA format")
+                QMessageBox.warning(None, "Warning", 
+                                  "The alignment file doesn't appear to be in FASTA format, which may cause RaxML to fail.")
+    except Exception as e:
+        logger.error(f"Error checking alignment format: {e}")
+        
+    # Log the command
+    logger.info(f"RAxML command: {' '.join(raxml_cmd)}")
+    
+    # Run RAxML
+    try:
+        # Capture start time
+        start_time = time.time()
+        
+        # Show starting message in progress if available
+        if progress:
+            if hasattr(progress, 'setLabelText'):
+                progress.setLabelText("Starting RAxML...")
+            progress.setValue(10)
+            QApplication.processEvents()
+        
+        # Determine the correct working directory to use
+        # If we created a raxml_temp_dir with sanitized names, use it, otherwise use the provided working_dir
+        actual_working_dir = result_info.get("raxml_working_dir", working_dir)
+        
+        # CRITICAL FIX: When we're using the temp directory with sanitized names,
+        # we must use the simplified filename "alignment.fasta" in the command
+        # This ensures RAxML is using the sanitized file from our temp directory
+        if "raxml_working_dir" in result_info and actual_working_dir == result_info["raxml_working_dir"]:
+            # If we're running from the special temp directory, use just the alignment.fasta filename
+            # This is the simplest, most reliable approach
+            alignment_file_arg = "alignment.fasta"
+            logger.info(f"CRITICAL FIX: Using simple filename '{alignment_file_arg}' since we're running in the sanitized temp directory")
+        else:
+            # For any other case, use the absolute path to avoid ambiguity
+            alignment_file_arg = os.path.abspath(alignment_file)
+            logger.info(f"Using absolute alignment path: {alignment_file_arg}")
+        
+        # Update the command with the correct alignment path
+        if is_raxml_ng:
+            # Find the index of --msa in the command
+            msa_index = raxml_cmd.index("--msa") if "--msa" in raxml_cmd else -1
+            if msa_index >= 0 and msa_index + 1 < len(raxml_cmd):
+                raxml_cmd[msa_index + 1] = alignment_file_arg
+                logger.info(f"Updated RAxML-NG command with alignment file: {alignment_file_arg}")
+        else:
+            # Find the index of -s in the command
+            s_index = raxml_cmd.index("-s") if "-s" in raxml_cmd else -1
+            if s_index >= 0 and s_index + 1 < len(raxml_cmd):
+                raxml_cmd[s_index + 1] = alignment_file_arg
+                logger.info(f"Updated standard RAxML command with alignment file: {alignment_file_arg}")
+        
+        # Log the full command for debugging
+        logger.info(f"Running RAxML with command: {' '.join(raxml_cmd)}")
+        logger.info(f"Working directory: {actual_working_dir}")
+        
+        # VERIFICATION: Check if the alignment file in the command actually exists
+        # Find the alignment file argument in the command
+        alignment_arg = None
+        if is_raxml_ng:
+            # RAxML-NG uses --msa
+            msa_index = raxml_cmd.index("--msa") if "--msa" in raxml_cmd else -1
+            if msa_index >= 0 and msa_index + 1 < len(raxml_cmd):
+                alignment_arg = raxml_cmd[msa_index + 1]
+        else:
+            # Standard RAxML uses -s
+            s_index = raxml_cmd.index("-s") if "-s" in raxml_cmd else -1
+            if s_index >= 0 and s_index + 1 < len(raxml_cmd):
+                alignment_arg = raxml_cmd[s_index + 1]
+        
+        # If using a relative path, check relative to working directory
+        if alignment_arg and not os.path.isabs(alignment_arg):
+            full_path = os.path.join(actual_working_dir, alignment_arg)
+            if os.path.exists(full_path):
+                logger.info(f"VERIFICATION PASSED: Alignment file exists: {full_path}")
+            else:
+                logger.error(f"VERIFICATION FAILED: Alignment file does not exist: {full_path}")
+        elif alignment_arg and os.path.exists(alignment_arg):
+            logger.info(f"VERIFICATION PASSED: Alignment file exists: {alignment_arg}")
+        else:
+            logger.error(f"VERIFICATION FAILED: Could not verify alignment file: {alignment_arg}")
+            
+        # Make sure all items in the command list are strings
+        raxml_cmd = [str(item) for item in raxml_cmd]
+        
+        # Store the command string in the result info for display to the user
+        command_string = ' '.join(raxml_cmd)
+        result_info["command"] = command_string
+        
+        process = subprocess.Popen(
+            raxml_cmd, 
+            cwd=actual_working_dir,  # Use the actual working directory
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,  # Line buffered
+            universal_newlines=True
+        )
+        
+        # Monitor process
+        if progress:
+            stdout_lines = []
+            stderr_lines = []
+            
+            # Use non-blocking reads
+            import select
+            
+            while process.poll() is None:
+                # Check if there's data to read from stdout/stderr
+                ready_to_read, _, _ = select.select([process.stdout, process.stderr], [], [], 0.1)
+                
+                for readable in ready_to_read:
+                    if readable == process.stdout:
+                        output = readable.readline()
+                        if output:
+                            stdout_lines.append(output.strip())
+                            logger.debug(f"RAxML stdout: {output.strip()}")
+                            
+                            # Update progress text if possible
+                            if hasattr(progress, 'setLabelText'):
+                                progress.setLabelText(f"Running RAxML: {output.strip()[:50]}")
+                    
+                    elif readable == process.stderr:
+                        output = readable.readline()
+                        if output:
+                            stderr_lines.append(output.strip())
+                            logger.debug(f"RAxML stderr: {output.strip()}")
+                
+                # Parse stdout_lines for better progress updates
+                if stdout_lines:
+                    latest_output = stdout_lines[-1]
+                    # Use different outputs to determine progress
+                    if "Starting ML tree search" in latest_output or "Starting ML search" in latest_output:
+                        progress.setValue(30)
+                    elif "Starting bootstrapping analysis" in latest_output:
+                        progress.setValue(50)
+                    elif "Bootstrap tree" in latest_output or "bootstrap replicate" in latest_output:
+                        # Try to extract bootstrap number
+                        try:
+                            bootstrap_match = re.search(r"[Bb]ootstrap (?:tree|replicate) #?(\d+)", latest_output)
+                            if bootstrap_match:
+                                bootstrap_num = int(bootstrap_match.group(1))
+                                bootstrap_total = params.get("bootstrap_replicates", 100)
+                                # Calculate progress percentage (50-90% range)
+                                bootstrap_progress = 50 + int((bootstrap_num / bootstrap_total) * 40)
+                                # Don't let progress go backward
+                                if bootstrap_progress > progress.value():
+                                    progress.setValue(bootstrap_progress)
+                        except Exception as e:
+                            logger.debug(f"Error parsing bootstrap progress: {e}")
+                    # If nothing matched, increment progress slightly over time
+                    elif not hasattr(progress, '_last_progress_time'):
+                        progress.setValue(20)
+                        setattr(progress, '_last_progress_time', time.time())
+                    elif time.time() - getattr(progress, '_last_progress_time') > 3.0:
+                        # Increment progress slightly every 3 seconds
+                        current_val = progress.value()
+                        if current_val < 80:  # Don't go above 80%
+                            progress.setValue(current_val + 1)
+                        setattr(progress, '_last_progress_time', time.time())
+                
+                QApplication.processEvents()
+                if hasattr(progress, 'wasCanceled') and progress.wasCanceled():
+                    logger.warning("RAxML process canceled by user")
+                    process.terminate()
+                    return False
+            
+            # Read any remaining output
+            stdout, stderr = process.communicate()
+            
+            if stdout:
+                for line in stdout.splitlines():
+                    if line.strip():
+                        stdout_lines.append(line.strip())
+                        logger.debug(f"RAxML stdout (final): {line.strip()}")
+            
+            if stderr:
+                for line in stderr.splitlines():
+                    if line.strip():
+                        stderr_lines.append(line.strip())
+                        logger.debug(f"RAxML stderr (final): {line.strip()}")
+            
+            progress.setValue(90)
+        else:
+            # If no progress dialog, just wait for completion
+            stdout, stderr = process.communicate()
+            logger.debug(f"RAxML stdout: {stdout}")
+            logger.debug(f"RAxML stderr: {stderr}")
+        
+        # Check if RAxML succeeded
+        if process.returncode == 0:
+            # Calculate runtime
+            end_time = time.time()
+            runtime = end_time - start_time
+            result_info["runtime"] = runtime
+            
+            logger.info(f"RAxML completed successfully in {runtime:.2f} seconds")
+            
+            # Find the tree file and store it in result_info
+            if "raxml_working_dir" in result_info:
+                raxml_dir = result_info["raxml_working_dir"]
+                tree_files = []
+                
+                # Check for RAxML-NG output files
+                if os.path.exists(os.path.join(raxml_dir, "result.raxml.bestTree")):
+                    tree_files.append(os.path.join(raxml_dir, "result.raxml.bestTree"))
+                if os.path.exists(os.path.join(raxml_dir, "result.raxml.support")):
+                    tree_files.append(os.path.join(raxml_dir, "result.raxml.support"))
+                
+                # Check for standard RAxML output files
+                if os.path.exists(os.path.join(raxml_dir, "RAxML_bestTree.result")):
+                    tree_files.append(os.path.join(raxml_dir, "RAxML_bestTree.result"))
+                if os.path.exists(os.path.join(raxml_dir, "RAxML_bipartitions.result")):
+                    tree_files.append(os.path.join(raxml_dir, "RAxML_bipartitions.result"))
+                
+                if tree_files:
+                    result_info["tree_file"] = tree_files[0]
+                    logger.info(f"Found tree file: {tree_files[0]}")
+                    
+                # Try to extract additional information like log-likelihood, etc.
+                log_files = []
+                if os.path.exists(os.path.join(raxml_dir, "result.raxml.log")):
+                    log_files.append(os.path.join(raxml_dir, "result.raxml.log"))
+                if os.path.exists(os.path.join(raxml_dir, "RAxML_info.result")):
+                    log_files.append(os.path.join(raxml_dir, "RAxML_info.result"))
+                    
+                # Parse log files for useful info
+                if log_files:
+                    logger.info(f"Parsing log file for additional information: {log_files[0]}")
+                    try:
+                        with open(log_files[0], 'r') as f:
+                            log_content = f.read()
+                            
+                            # Try to extract log-likelihood
+                            ll_match = re.search(r"Final LogLikelihood: ([-0-9.]+)", log_content)
+                            if ll_match:
+                                result_info["log_likelihood"] = ll_match.group(1)
+                                logger.info(f"Final log-likelihood: {result_info['log_likelihood']}")
+                    except Exception as e:
+                        logger.error(f"Error parsing log file: {e}")
+            
+            if progress:
+                progress.setValue(100)
+            return result_info
+        else:
+            stderr_output = '\n'.join(stderr_lines) if 'stderr_lines' in locals() else \
+                            (process.stderr.read() if process.stderr else "")
+            stdout_output = '\n'.join(stdout_lines) if 'stdout_lines' in locals() else \
+                           (process.stdout.read() if process.stdout else "")
+            
+            # Get detailed error information
+            error_msg = f"RAxML failed with return code {process.returncode}"
+            error_details = ""
+            
+            # Check stderr first
+            if stderr_output:
+                error_details += f"\nSTDERR:\n{stderr_output}"
+            
+            # Also include stdout which might have error info
+            if stdout_output:
+                error_details += f"\nSTDOUT:\n{stdout_output}"
+                
+            # Log both stderr and stdout for diagnosis
+            logger.error(error_msg)
+            if stderr_output:
+                logger.error(f"STDERR: {stderr_output}")
+            if stdout_output:
+                logger.error(f"STDOUT: {stdout_output}")
+                
+            # Do special checks for known issues
+            
+            # Check for missing shared libraries
+            if "error while loading shared libraries" in stderr_output:
+                lib_match = re.search(r"error while loading shared libraries: ([^:]+)", stderr_output)
+                if lib_match:
+                    missing_lib = lib_match.group(1)
+                    QMessageBox.critical(None, "RAxML Shared Library Error", 
+                                      f"RAxML is missing a required shared library: {missing_lib}\n\n" +
+                                      "You may need to install additional libraries to run RAxML.")
+                    return False
+            
+            # Check if the binary is actually executable
+            if "Permission denied" in stderr_output:
+                QMessageBox.critical(None, "RAxML Permission Error", 
+                                   "The RAxML binary cannot be executed due to permission issues.\n\n" +
+                                   "Try running: chmod +x " + raxml_path)
+                return False
+                
+            # Show error in UI if possible
+            QMessageBox.critical(None, "RAxML Error", 
+                               f"Failed to build tree with RAxML.\n\nCommand: {' '.join(raxml_cmd)}\n\n" +
+                               f"Error: {error_msg}\n\n" +
+                               f"Details: {error_details[:500]}...")
+            result_info["error"] = error_msg
+            return False
+    
+    except Exception as e:
+        import traceback
+        logger.error(f"Error running RAxML: {str(e)}")
+        logger.error(traceback.format_exc())
+        result_info["error"] = str(e)
+        return False
+
+def run_mrbayes(working_dir, alignment_file, progress=None):
+    """Run MrBayes for tree construction"""
+    # Simplified implementation - would need expansion for production use
+
+    # Create MrBayes command file
+    mb_commands = f"""begin mrbayes;
+        set autoclose=yes;
+        execute {alignment_file};
+        lset nst=6 rates=gamma;
+        mcmc ngen=10000 samplefreq=100 printfreq=100 diagnfreq=1000;
+        sumt burnin=25;
+        quit;
+    end;
+    """
+
+    mb_file = os.path.join(working_dir, "mb_commands.nex")
+    with open(mb_file, "w") as f:
+        f.write(mb_commands)
+
+    # Run MrBayes
+    mb_cmd = ["mb", mb_file]
+
+    process = subprocess.Popen(
+        mb_cmd,
+        cwd=working_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    # Monitor process
+    if progress:
+        while process.poll() is None:
+            progress.setValue(50)  # Simplified progress
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                process.terminate()
+                return
+            time.sleep(0.1)
+
+        progress.setValue(100)
+    else:
+        process.wait()
+
+def find_tree_file(directory, name_map=None):
+    """Find generated tree file in directory
+    
+    Args:
+        directory: Directory to search for tree files
+        name_map: Optional mapping of sequence names to restore full names in tree file
+    
+    Returns:
+        Path to tree file or None if not found
+    """
+    # List of possible tree file extensions
+    possible_extensions = [".tre", ".nwk", ".newick", ".tree"]
+    
+    # First, log all files in the directory for debugging
+    logger.info(f"Searching for tree file in directory: {directory}")
+    logger.info(f"Files in directory: {os.listdir(directory)}")
+    
+    tree_file_path = None
+    
+    # First priority: Check for bootstrap support trees from RAxML-NG
+    # These contain both the tree structure and the bootstrap values
+    raxml_ng_support_tree = os.path.join(directory, "result.raxml.support")
+    if os.path.exists(raxml_ng_support_tree):
+        logger.info(f"Found RAxML-NG support tree file (with bootstrap values): {raxml_ng_support_tree}")
+        # Check file contents to make sure it's valid
+        try:
+            with open(raxml_ng_support_tree, 'r') as f:
+                content = f.read().strip()
+                logger.info(f"Support tree file contents preview: {content[:100]}...")
+                if content and ('(' in content or ')' in content):
+                    # This seems to be a valid Newick format tree with bootstrap values
+                    logger.info("Using tree with bootstrap support values")
+                    tree_file_path = raxml_ng_support_tree
+        except Exception as e:
+            logger.error(f"Error reading RAxML-NG support tree file: {e}")
+    
+    # If not found, check for bipartition trees from standard RAxML (with bootstrap values)
+    if not tree_file_path:
+        raxml_bipartition = os.path.join(directory, "RAxML_bipartitions.result")
+        if os.path.exists(raxml_bipartition):
+            logger.info(f"Found standard RAxML bipartition tree file (with bootstrap values): {raxml_bipartition}")
+            # Check file contents
+            try:
+                with open(raxml_bipartition, 'r') as f:
+                    content = f.read().strip()
+                    logger.info(f"Bipartition tree file contents preview: {content[:100]}...")
+                    if content and ('(' in content or ')' in content):
+                        # This seems to be a valid Newick format tree with bootstrap values
+                        logger.info("Using tree with bootstrap support values")
+                        tree_file_path = raxml_bipartition
+            except Exception as e:
+                logger.error(f"Error reading standard RAxML bipartition tree file: {e}")
+    
+    # If still not found, check standard RAxML-NG output (without bootstrap values)
+    if not tree_file_path:
+        raxml_ng_tree = os.path.join(directory, "result.raxml.bestTree")
+        if os.path.exists(raxml_ng_tree):
+            logger.info(f"Found RAxML-NG best tree file: {raxml_ng_tree}")
+            # Check file contents to make sure it's valid
+            try:
+                with open(raxml_ng_tree, 'r') as f:
+                    content = f.read().strip()
+                    logger.info(f"Tree file contents preview: {content[:100]}...")
+                    if content and ('(' in content or ')' in content):
+                        # This seems to be a valid Newick format tree
+                        logger.info("Using best ML tree (without bootstrap values)")
+                        tree_file_path = raxml_ng_tree
+            except Exception as e:
+                logger.error(f"Error reading RAxML-NG tree file: {e}")
+    
+    # If still not found, check standard RAxML output (without bootstrap values)
+    if not tree_file_path:
+        raxml_tree = os.path.join(directory, "RAxML_bestTree.result")
+        if os.path.exists(raxml_tree):
+            logger.info(f"Found standard RAxML best tree file: {raxml_tree}")
+            # Check file contents
+            try:
+                with open(raxml_tree, 'r') as f:
+                    content = f.read().strip()
+                    logger.info(f"Tree file contents preview: {content[:100]}...")
+                    if content and ('(' in content or ')' in content):
+                        # This seems to be a valid Newick format tree
+                        logger.info("Using best ML tree (without bootstrap values)")
+                        tree_file_path = raxml_tree
+            except Exception as e:
+                logger.error(f"Error reading standard RAxML tree file: {e}")
+    
+    # Also check for other common RAxML-NG output files
+    if not tree_file_path:
+        raxml_ng_bestModelTree = os.path.join(directory, "result.raxml.bestModelTree")
+        if os.path.exists(raxml_ng_bestModelTree):
+            logger.info(f"Found RAxML-NG best model tree file: {raxml_ng_bestModelTree}")
+            try:
+                with open(raxml_ng_bestModelTree, 'r') as f:
+                    content = f.read().strip()
+                    if content and ('(' in content or ')' in content):
+                        logger.info("Using best model tree")
+                        tree_file_path = raxml_ng_bestModelTree
+            except Exception as e:
+                logger.error(f"Error reading RAxML-NG best model tree file: {e}")
+    
+    # Finally, check for any files with standard extensions
+    if not tree_file_path:
+        for file in os.listdir(directory):
+            for ext in possible_extensions:
+                if file.endswith(ext):
+                    candidate_tree_file = os.path.join(directory, file)
+                    logger.info(f"Found tree file with extension {ext}: {candidate_tree_file}")
+                    # Check file contents
+                    try:
+                        with open(candidate_tree_file, 'r') as f:
+                            content = f.read().strip()
+                            if content and ('(' in content or ')' in content):
+                                logger.info(f"Using tree file found by extension: {file}")
+                                tree_file_path = candidate_tree_file
+                                break
+                    except Exception as e:
+                        logger.error(f"Error reading tree file {candidate_tree_file}: {e}")
+            if tree_file_path:
+                break
+    
+    # If we didn't find a tree file, return None
+    if not tree_file_path:
+        logger.warning("No valid tree file found in directory")
+        return None
+    
+    # Now if we have a tree file and a name map, directly modify the tree file to restore full names
+    if tree_file_path and name_map:
+        try:
+            logger.info(f"Attempting to directly restore full sequence names in tree file: {tree_file_path}")
+            
+            # Read the tree file content
+            with open(tree_file_path, 'r') as f:
+                tree_content = f.read()
+            
+            # Log the original tree content for debugging
+            logger.debug(f"Original tree content: {tree_content[:300]}")
+            
+            # Use a different approach with regex to avoid duplicate replacements
+            import re
+            
+            # Process the tree file more carefully with regex to avoid duplicates
+            # We need to identify terminal node names in the Newick format
+            
+            # First check if there are any duplicated node names in the tree
+            # This might indicate a problem with the name mapping or the tree itself
+            node_pattern = re.compile(r'[,\(]([^:,\(\)]+):|^\s*([^:,\(\)]+):')
+            node_matches = node_pattern.findall(tree_content)
+            
+            # Collect all node names and their positions
+            node_names = []
+            for match in node_matches:
+                # The match might be in group 1 or 2 depending on the pattern
+                name = match[0] if match[0] else match[1]
+                # Remove any quotes
+                name = name.strip('\'"')
+                node_names.append(name)
+            
+            # Log all node names found in the tree to help with debugging
+            logger.info(f"Found {len(node_names)} node names in the tree file")
+            logger.info(f"Node names sample: {node_names[:10]}")
+            
+            # Check for duplicates
+            node_count = {}
+            for name in node_names:
+                if name in node_count:
+                    node_count[name] += 1
+                else:
+                    node_count[name] = 1
+            
+            # Log any duplicates found
+            duplicates = [name for name, count in node_count.items() if count > 1]
+            if duplicates:
+                logger.warning(f"Found duplicate node names in tree file: {duplicates}")
+            
+            # Log the name_map for debugging
+            logger.info(f"Name map contains {len(name_map)} entries for restoring original names")
+            for k, v in list(name_map.items())[:10]:  # Show up to 10 entries
+                logger.info(f"  Map entry: {k} -> {v}")
+                
+            # Create a prioritized name map that will handle duplicates intelligently
+            # We prioritize mapping in this order:
+            # 1. Exact matches of the full modified name
+            # 2. First part matches for names with spaces
+            # 3. Matches of other parts of the name if needed
+            prioritized_map = {}
+            
+            # SPECIAL HANDLING FOR seq1, seq2, etc. NAMES
+            # If the node names look like seq1, seq2, etc., prioritize direct mapping first
+            seq_pattern = re.compile(r'^seq\d+$')
+            for node_name in node_names:
+                if seq_pattern.match(node_name) and node_name in name_map:
+                    # This is our sanitized naming format - use direct mapping
+                    prioritized_map[node_name] = name_map[node_name]
+                    logger.info(f"FIXED: Direct mapping for sanitized name: {node_name} -> {name_map[node_name]}")
+                    
+                    # Verify that we're not creating a self-referential mapping
+                    if node_name == name_map[node_name]:
+                        logger.warning(f"WARNING: Self-referential mapping detected: {node_name} -> {node_name}")
+                        # Look through the name map to see if we can find the real original name
+                        found_better_mapping = False
+                        for k, v in name_map.items():
+                            if k != node_name and not seq_pattern.match(k) and v != node_name:
+                                logger.info(f"Found potential better mapping: {node_name} -> {v}")
+                                found_better_mapping = True
+                        if not found_better_mapping:
+                            logger.warning("Could not find better mapping in the name map")
+            
+            # Only proceed with more complex mapping if we couldn't find seq pattern matches
+            if not prioritized_map:
+                logger.warning("Could not find direct seq pattern matches, trying more complex mapping")
+                # First pass: exact matches that are unique (highest priority)
+                for modified_name, original_name in name_map.items():
+                    if modified_name in node_names and node_count.get(modified_name, 0) == 1:
+                        # This is a direct unique match
+                        prioritized_map[modified_name] = original_name
+                        logger.debug(f"Added unique exact match: {modified_name} -> {original_name}")
+                
+                # Second pass: handle first part matching for duplicates
+                for name in duplicates:
+                    # This name appears multiple times in the tree, so we need special handling
+                    matches = []
+                    
+                    # Look for matches in the name map
+                    for modified_name, original_name in name_map.items():
+                        # Check if this name is a first part of the original
+                        if ' ' in original_name:
+                            first_part = original_name.split(' ')[0]
+                            if name == first_part or name == first_part.replace(' ', '_'):
+                                matches.append((modified_name, original_name))
+                    
+                    # If we found potential matches, store them for special handling
+                    if matches:
+                        # For now just log this - we'll handle replacing multiple occurrences later
+                        logger.info(f"Found {len(matches)} potential matches for duplicate name: {name}")
+                        for mod, orig in matches:
+                            # Add to our special map but with a unique identifier
+                            # We'll use this in our replacement regex to ensure uniqueness
+                            prioritized_map[f"{name}__SPECIAL"] = matches
+            
+            # Create a regex pattern to match node names in Newick format
+            # This matches node names that are followed by a colon (terminal nodes)
+            node_replace_pattern = re.compile(r'([\(,])([^:,\(\)]+):|^([^:,\(\)]+):')
+            
+            # Create a dictionary to keep track of duplicates as they're replaced
+            duplicate_counts = {name: 0 for name in duplicates}
+            
+            # Function to replace matched node names
+            def replace_node_name(match):
+                # The node name might be in group 2 or 3 depending on where it matched
+                prefix = match.group(1) if match.group(1) else ''
+                node_name = match.group(2) if match.group(2) else match.group(3)
+                
+                # Remove any quotes
+                clean_name = node_name.strip('\'"')
+                
+                # Handle duplicate names specially
+                if clean_name in duplicates:
+                    # Count this occurrence of the duplicate
+                    duplicate_counts[clean_name] += 1
+                    count = duplicate_counts[clean_name]
+                    
+                    # Check if we have special handling for this duplicate
+                    special_key = f"{clean_name}__SPECIAL"
+                    if special_key in prioritized_map:
+                        # Get the list of potential matches
+                        matches = prioritized_map[special_key]
+                        
+                        # If we have enough matches for this count, use the corresponding one
+                        if count <= len(matches):
+                            modified_name, original_name = matches[count-1]
+                            logger.info(f"Using match {count} for duplicate '{clean_name}': {original_name}")
+                            
+                            # Use the original format (with or without quotes)
+                            if node_name.startswith('"') and node_name.endswith('"'):
+                                return f'{prefix}"{original_name}":'
+                            elif node_name.startswith("'") and node_name.endswith("'"):
+                                return f"{prefix}'{original_name}':"
+                            else:
+                                return f"{prefix}{original_name}:"
+                
+                # Regular (non-duplicate) handling
+                # First check for exact matches
+                if clean_name in prioritized_map:
+                    original_name = prioritized_map[clean_name]
+                    # Use the original format (with or without quotes)
+                    if node_name.startswith('"') and node_name.endswith('"'):
+                        return f'{prefix}"{original_name}":'
+                    elif node_name.startswith("'") and node_name.endswith("'"):
+                        return f"{prefix}'{original_name}':"
+                    else:
+                        return f"{prefix}{original_name}:"
+                
+                # Check for first part matches if not an exact match
+                for modified_name, original_name in name_map.items():
+                    # Try first part match (for truncated names)
+                    if ' ' in original_name:
+                        first_part = original_name.split(' ')[0]
+                        if clean_name == first_part:
+                            # Use the original format (with or without quotes)
+                            if node_name.startswith('"') and node_name.endswith('"'):
+                                return f'{prefix}"{original_name}":'
+                            elif node_name.startswith("'") and node_name.endswith("'"):
+                                return f"{prefix}'{original_name}':"
+                            else:
+                                return f"{prefix}{original_name}:"
+                
+                # No match found, return unchanged
+                return match.group(0)
+            
+            # Replace node names in the tree content
+            modified_tree_content = node_replace_pattern.sub(replace_node_name, tree_content)
+            
+            # Only update if changes were made
+            if modified_tree_content != tree_content:
+                tree_content = modified_tree_content
+                logger.info("Successfully replaced node names in tree file")
+            
+            # Write the modified tree content back to the file
+            with open(tree_file_path, 'w') as f:
+                f.write(tree_content)
+                
+            # Log success
+            logger.info(f"Successfully restored full sequence names in tree file")
+            
+            # Log the modified tree content for debugging
+            logger.debug(f"Modified tree content: {tree_content[:300]}")
+            
+        except Exception as e:
+            logger.error(f"Error modifying tree file to restore names: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    return tree_file_path
