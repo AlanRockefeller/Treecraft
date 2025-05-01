@@ -223,9 +223,9 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)
         
         # Set application icon
-        self.app_icon = QIcon("/home/alan/treecraft/treecraft_icon_32px.png")
+        # Use a relative path to the application resources
+        self.app_icon = QIcon("resources/treecraft_icon_32px.png")
         self.setWindowIcon(self.app_icon)
-        
         # Set up system tray icon
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(self.app_icon)
