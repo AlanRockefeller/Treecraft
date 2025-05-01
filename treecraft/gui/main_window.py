@@ -15,7 +15,8 @@ from PyQt6.QtWidgets import (
     QLabel, QListWidget, QStatusBar, QMenu, QMenuBar, QFileDialog, QApplication,
     QMessageBox, QInputDialog, QListWidgetItem, QDialog, QComboBox, QPushButton,
     QFormLayout, QDialogButtonBox, QToolButton, QCheckBox, QSpinBox,
-    QTabWidget, QScrollArea, QGridLayout, QTextEdit, QFrame, QColorDialog
+    QTabWidget, QScrollArea, QGridLayout, QTextEdit, QFrame, QColorDialog,
+    QSystemTrayIcon
 )
 from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QAction, QActionGroup, QIcon, QFont, QColor, QPixmap
@@ -220,6 +221,17 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("TreeCraft")
         self.resize(1200, 800)
+        
+        # Set application icon
+        self.app_icon = QIcon("/home/alan/treecraft/treecraft_icon_32px.png")
+        self.setWindowIcon(self.app_icon)
+        
+        # Set up system tray icon
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.app_icon)
+        self.tray_icon.setToolTip("TreeCraft")
+        self.tray_icon.activated.connect(self.tray_icon_activated)
+        self.tray_icon.show()
         
         # Set up logging
         self.setup_logging()
@@ -2555,6 +2567,15 @@ PARAMETERS USED:
         
         logger.info("One-way scrollbar synchronization setup complete")
         
+    def tray_icon_activated(self, reason):
+        """Handle system tray icon activation"""
+        # QSystemTrayIcon.ActivationReason.Trigger = 3 (single click)
+        # QSystemTrayIcon.ActivationReason.DoubleClick = 2
+        if reason == 3 or reason == 2:  # Single or double click
+            self.show()
+            self.raise_()
+            self.activateWindow()
+    
     def closeEvent(self, event):
         """Clean up resources before closing the main window"""
         logger = logging.getLogger("treecraft")
