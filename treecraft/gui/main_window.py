@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QTabWidget, QScrollArea, QGridLayout, QTextEdit, QFrame, QColorDialog,
     QSystemTrayIcon
 )
-from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QObject, QTimer
+from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QObject, QTimer # QApplication, Qt are used
 from PyQt6.QtGui import QAction, QActionGroup, QIcon, QFont, QColor, QPixmap
 
 from Bio import SeqIO, AlignIO
@@ -168,7 +168,7 @@ class AlignmentViewer(QTextEdit):
         
     def refresh_alignment(self):
         """Update the alignment display"""
-        if not self.alignment:
+        if not self.alignment: # Catches None or empty list/MSA
             self.setPlainText("No alignment to display")
             return
 
@@ -192,19 +192,24 @@ class AlignmentViewer(QTextEdit):
             }
             self.setStyleSheet("QTextEdit { background-color: #ffffff; color: #000000; }")
         
-        # Create HTML representation of the alignment
         html = "<pre style='margin: 0; padding: 0; font-family: Courier New'>"
         
-        for record in self.alignment:
-            # Add only the sequence content, not the ID
+        # self.alignment can be a MultipleSeqAlignment or a list of SeqRecords
+        records_to_display = []
+        if isinstance(self.alignment, MultipleSeqAlignment):
+            records_to_display = self.alignment
+        elif isinstance(self.alignment, list) and all(isinstance(rec, SeqRecord) for rec in self.alignment):
+            records_to_display = self.alignment
+        else:
+            self.setPlainText("Invalid alignment data type")
+            logger.error(f"AlignmentViewer received invalid alignment type: {type(self.alignment)}")
+            return
+
+        for record in records_to_display:
             for nucleotide in str(record.seq):
-                # Get the proper color for this nucleotide
                 nucleotide = nucleotide.upper()
-                color = colors.get(nucleotide, QColor(200, 200, 200))  # Default color for unknown nucleotides
-                
-                # Format as colored text
+                color = colors.get(nucleotide, QColor(200, 200, 200))
                 html += f"<span style='color: {color.name()}'>{nucleotide}</span>"
-            
             html += "<br>"
         
         html += "</pre>"
@@ -240,10 +245,11 @@ class MainWindow(QMainWindow):
         
         # Initialize member variables
         self.sequence_list = SequenceListWidget()
-        self.current_alignment = None
+        self.current_alignment = None # Can be MultipleSeqAlignment or list of SeqRecords
         self.current_tree = None
         self.temp_dir = tempfile.mkdtemp(prefix="treecraft_")
         logger.debug(f"Created temporary directory: {self.temp_dir}")
+        self.raxml_name_map = {} # For RAxML name handling
         
         # Debug console window (created on demand)
         self.debug_console = None
@@ -890,7 +896,7 @@ class MainWindow(QMainWindow):
         
         # Load sequences
         try:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor) # Set wait cursor
             logger = logging.getLogger("treecraft")
             logger.info(f"Loading sequences from file: {file_path}")
             
@@ -903,7 +909,8 @@ class MainWindow(QMainWindow):
             
             if not records:
                 QMessageBox.warning(self, "Warning", "No sequences found in the file")
-                return
+                # QApplication.restoreOverrideCursor() # Ensure cursor is restored - already in finally
+                return # Return is important here, before finally if we want to avoid other operations
                 
             logger.info(f"Loaded {len(records)} sequences")
             
@@ -980,13 +987,13 @@ class MainWindow(QMainWindow):
             # Clear tree if we added any new sequences
             if new_count > 0:
                 self.current_tree = None
-                self.tree_canvas.set_tree(None)
+                self.tree_canvas.set_tree(None) # This will internally handle layout_is_dirty
             
         except Exception as e:
             logger.error(f"Error loading sequences: {e}")
             QMessageBox.critical(self, "Error", f"Failed to load sequences: {str(e)}")
         finally:
-            QApplication.restoreOverrideCursor()
+            QApplication.restoreOverrideCursor() # Restore cursor in finally block
             
     def update_sequence_count(self):
         """Update the sequence count in the header"""
@@ -1034,26 +1041,32 @@ class MainWindow(QMainWindow):
                 description = self.sequence_list.descriptions.get(seq_id, seq_id)
                 record = SeqRecord(Seq(sequence), id=seq_id, description=description)
                 records.append(record)
-            
-        # Create a MultipleSeqAlignment object (even if sequences aren't aligned)
-        try:
-            from Bio.Align import MultipleSeqAlignment
-            alignment = MultipleSeqAlignment(records)
-            self.current_alignment = records
-            self.alignment_viewer.set_alignment(alignment)
-            
+
+        if not records:
+            self.current_alignment = None
+            self.alignment_viewer.set_alignment(None)
             # Reset the vertical scroll position to match the sequence list
-            # This helps maintain synchronization after updates
             QTimer.singleShot(100, lambda: self.sync_alignment_scroll_position())
-            
-        except Exception as e:
-            # Fallback: don't use alignment but still display sequences
-            logger.error(f"Error creating alignment view: {e}")
-            self.alignment_viewer.set_alignment(records)
-            
-            # Still try to sync the scroll position
-            QTimer.singleShot(100, lambda: self.sync_alignment_scroll_position())
-    
+            return
+
+        lengths = [len(record.seq) for record in records]
+        all_same_length = all(l == lengths[0] for l in lengths) if lengths else True
+
+        if all_same_length:
+            # Proceed with creating a formal MultipleSeqAlignment object
+            alignment = MultipleSeqAlignment(records)
+            self.current_alignment = alignment # Store the actual MSA object
+            self.alignment_viewer.set_alignment(alignment)
+            logger.debug("Created MultipleSeqAlignment as all sequences are of the same length.")
+        else:
+            # Log a message and display sequences as a list
+            logger.info("Displaying sequences in alignment view; sequences are not of uniform length and won't be treated as a formal alignment.")
+            self.current_alignment = records # Store the list of records
+            self.alignment_viewer.set_alignment(records) # AlignmentViewer can handle a list of SeqRecords
+
+        # Reset the vertical scroll position to match the sequence list
+        QTimer.singleShot(100, lambda: self.sync_alignment_scroll_position())
+
     def sync_alignment_scroll_position(self):
         """Force sync the alignment position to match the sequence list"""
         # If we're already in a synchronizing operation, avoid recursion
@@ -1079,7 +1092,7 @@ class MainWindow(QMainWindow):
                     # Calculate line height in alignment view
                     alignment_line_height = self.alignment_viewer.fontMetrics().height()
                     
-                    # Calculate position for alignment based on first visible sequence
+                    # Calculate new position for alignment based on first visible sequence
                     new_pos = first_visible_row * alignment_line_height
                     
                     # Update the alignment viewer scroll position
@@ -1504,76 +1517,59 @@ class MainWindow(QMainWindow):
                 import tempfile
                 temp_dir = tempfile.mkdtemp(prefix="raxml_")
                 
-                # Write alignment to temporary file
-                aligned_file = os.path.join(temp_dir, "alignment.fasta")
-                with open(aligned_file, "w") as f:
-                    for record in self.current_alignment:
-                        # Ensure sequence ID has no spaces - RAxML will truncate at space
-                        safe_id = record.id.replace(" ", "_")
-                        f.write(f">{safe_id}\n{record.seq}\n")
+                # --- RAxML Name Handling: Pre-processing ---
+                self.raxml_name_map = {} # Ensure it's fresh for this run
+                sanitized_records = []
+                # Ensure self.current_alignment is a list of SeqRecords if it's an MSA object
+                alignment_records = list(self.current_alignment) if isinstance(self.current_alignment, MultipleSeqAlignment) else self.current_alignment
+
+                logger.info(f"Preparing alignment for RAxML. Original alignment has {len(alignment_records)} records.")
+
+                for i, record in enumerate(alignment_records):
+                    original_full_name = record.description if record.description and record.description.strip() else record.id
+                    # RAxML requires simple names, typically <=10 chars for some older formats it might interact with,
+                    # though modern RAxML-ng is more flexible. Using a simple, unique, safe ID.
+                    sanitized_id = f"SEQ_{i}"
+                    self.raxml_name_map[sanitized_id] = original_full_name
+                    # Create a new SeqRecord with the sanitized ID and original sequence.
+                    # RAxML generally only cares about the ID in the > line for the tree.
+                    sanitized_records.append(SeqRecord(record.seq, id=sanitized_id, description=""))
+                    logger.debug(f"Mapping: '{sanitized_id}' -> '{original_full_name}'")
+
+                aligned_file_path = os.path.join(temp_dir, "alignment_sanitized_for_raxml.fasta")
+                SeqIO.write(sanitized_records, aligned_file_path, "fasta")
+                logger.info(f"RAxML pre-processing: Wrote {len(sanitized_records)} records with sanitized names to {aligned_file_path}")
+                # --- End RAxML Name Handling: Pre-processing ---
                 
                 # Run RAxML with progress dialog
-                result_info = run_raxml(temp_dir, aligned_file, params, progress)
+                result_info = run_raxml(temp_dir, aligned_file_path, params, progress) # Pass the sanitized file
                 
                 if result_info:
-                    # Find the tree file
-                    sequence_name_map = result_info.get("sequence_name_map", {})
-                    # Use the dedicated RAxML working dir if provided by our updated code
                     tree_dir = result_info.get("raxml_working_dir", temp_dir)
-                    tree_file = find_tree_file(tree_dir, sequence_name_map)
+                    tree_file = find_tree_file(tree_dir)
                     
                     if tree_file and os.path.exists(tree_file):
-                        # Load and display the tree
                         from Bio import Phylo
                         tree = Phylo.read(tree_file, "newick")
                         
-                        # Replace the seq1, seq2 terminal names with the original names from the mapping
-                        if "sequence_name_map" in result_info:
-                            name_map = result_info["sequence_name_map"]
-                            logger.info(f"Restoring original names in tree from name map with {len(name_map)} entries")
-                            
-                            # Go through all terminal nodes and replace seq names with originals
-                            logger.info(f"MAPPING FIX: Actual name map has {len(name_map)} entries with sample: {list(name_map.items())[:5]}")
-                            
-                            # Check if we have the right kind of mapping (simple seq# -> original name)
-                            has_seq_entries = any(key.startswith('seq') and key[3:].isdigit() for key in name_map.keys())
-                            if has_seq_entries:
-                                for terminal in tree.get_terminals():
-                                    original_name = None
-                                    
-                                    # First try direct mapping
-                                    if terminal.name in name_map:
-                                        original_name = name_map[terminal.name]
-                                    # Also check for seq prefix without underscore (RaxML output often drops underscores)
-                                    elif terminal.name.startswith('seq') and terminal.name[3:].isdigit():
-                                        seq_id = terminal.name
-                                        # Try exact match first
-                                        if seq_id in name_map:
-                                            original_name = name_map[seq_id]
-                                        # Try adding underscore if needed
-                                        elif 'seq_' + terminal.name[3:] in name_map:
-                                            original_name = name_map['seq_' + terminal.name[3:]]
-                                    
-                                    if original_name:
-                                        logger.info(f"Replacing {terminal.name} with {original_name}")
-                                        terminal.name = original_name
-                                    else:
-                                        logger.warning(f"Could not find mapping for terminal: {terminal.name}")
+                        # --- RAxML Name Handling: Post-processing ---
+                        logger.info(f"RAxML post-processing: Restoring original names using self.raxml_name_map ({len(self.raxml_name_map)} entries).")
+                        restored_count = 0
+                        not_found_count = 0
+                        for terminal in tree.get_terminals():
+                            sanitized_name = terminal.name # This will be "SEQ_0", "SEQ_1", etc.
+                            if sanitized_name in self.raxml_name_map:
+                                original_name = self.raxml_name_map[sanitized_name]
+                                terminal.name = original_name
+                                restored_count +=1
+                                logger.debug(f"Restored RAxML name: '{sanitized_name}' -> '{original_name}'")
                             else:
-                                logger.warning("Name map does not contain seq# entries, tree may display with sanitized names")
-                                
-                            # Do a final check for any truncated or underscore-containing names
-                            # Sometimes RAxML truncates long names or adds underscores
-                            for terminal in tree.get_terminals():
-                                terminal_name = terminal.name
-                                # Check for truncated or partial names (indicated by _partial, _cds, etc.)
-                                if any(suffix in terminal_name for suffix in ['_partial', '_cds', '_gene', '_region', '_complete']):
-                                    # Try to find the full name in our sequence list
-                                    for seq_id, desc in self.sequence_list.descriptions.items():
-                                        if terminal_name in desc or (terminal_name.replace('_', ' ') in desc):
-                                            logger.info(f"Fixing truncated name: {terminal_name} -> {desc}")
-                                            terminal.name = desc
-                                            break
+                                not_found_count +=1
+                                logger.warning(f"RAxML post-processing: Could not find original name for sanitized ID: '{sanitized_name}' in map.")
+                        logger.info(f"RAxML name restoration: {restored_count} names restored, {not_found_count} not found in map.")
+                        if not_found_count > 0 and restored_count < len(sanitized_records): # Log map if there were issues
+                             logger.warning(f"RAxML Name Map dump for problematic tree: {self.raxml_name_map}")
+                        # --- End RAxML Name Handling: Post-processing ---
                         
                         self.current_tree = tree
                         # Store that this is a RaxML tree to help with sequence matching
@@ -1734,7 +1730,7 @@ PARAMETERS USED:
                         # Verify the file was created and has content
                         import os
                         if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                            self.statusBar().showMessage(f"Tree exported to {file_path}", 5000)
+                            self.statusbar.showMessage(f"Tree exported to {file_path}", 5000)
                         else:
                             QMessageBox.critical(self, "Export Error", f"Failed to export tree: File is empty")
                     except Exception as e:
@@ -2077,263 +2073,35 @@ PARAMETERS USED:
         """Delete a sequence from the tree and dataset via right-click"""
         logger = logging.getLogger("treecraft")
         logger.debug(f"Delete request for node: {node_name}")
-        
-        # Log all available sequences for debugging
-        logger.debug(f"Available sequences: {list(self.sequence_list.sequences.keys())}")
-        
-        # Fix duplicate names issue (like "KX897432.1_KX897432.1")
-        # Detect and clean up self-repeating patterns in the node name
-        if node_name:
-            # Special handling for node names with leaf_ prefix
-            if node_name.startswith("leaf_"):
-                logger.debug(f"Extracting actual node name from leaf prefix: {node_name}")
-                # Remove the leaf_ prefix to get the actual node name
-                parts = node_name.split("_", 1)
-                if len(parts) > 1:
-                    node_name = parts[1]
-                    logger.debug(f"Extracted node name: {node_name}")
-            
-            # Check for duplicated node names like KX897432.1_KX897432.1
-            parts = node_name.split('_')
-            if len(parts) > 1 and parts[0] == parts[1]:
-                logger.warning(f"Detected exact duplicated name parts in node name: {node_name}")
-                node_name = parts[0]  # Use just the first part
-                logger.info(f"Simplified duplicated name to: {node_name}")
-            
-            # Check for repeated space-separated segments 
-            elif ' ' in node_name:
-                words = node_name.split()
-                # Check if same word appears multiple times (e.g., "KX897432.1 KX897432.1")
-                if len(set(words)) < len(words):
-                    logger.warning(f"Detected repeated words in: {node_name}")
-                    # Keep only unique parts to build the clean name
-                    clean_name = ' '.join(dict.fromkeys(words))
-                    logger.info(f"Cleaned name from '{node_name}' to '{clean_name}'")
-                    node_name = clean_name
-        
-        # Initialize sequence_id to None
-        sequence_id = None
-        
-        # Direct attempt to find the sequence ID
-        if node_name in self.sequence_list.sequences:
-            sequence_id = node_name
-            logger.debug(f"Direct match found: {node_name}")
-        else:
-            # Try a case-insensitive match which helps with many issues
-            for seq_id in self.sequence_list.sequences.keys():
-                if seq_id.upper() == node_name.upper():
-                    sequence_id = seq_id
-                    logger.debug(f"Case-insensitive match: {node_name} -> {seq_id}")
-                    break
-                    
-            # If still not found, check if the name is a substring
-            if not sequence_id:
-                for seq_id in self.sequence_list.sequences.keys():
-                    if node_name in seq_id or seq_id in node_name:
-                        sequence_id = seq_id
-                        logger.debug(f"Substring match: {node_name} in {seq_id}")
-                        break
-        
-        # If no direct match, try more matching approaches
-        if not sequence_id:
-            found = False
-            
-            # Try matching by description
+
+        sequence_id_to_delete = None
+
+        # Primary Search: Match node_name (expected to be the full display name/description)
+        # with the values in self.sequence_list.descriptions.
+        if self.sequence_list.descriptions:
             for seq_id, desc in self.sequence_list.descriptions.items():
-                if desc == node_name or seq_id == node_name:
-                    sequence_id = seq_id
-                    found = True
-                    logger.debug(f"Found exact match by description: {desc} -> {seq_id}")
+                if desc == node_name:
+                    sequence_id_to_delete = seq_id
+                    logger.debug(f"Found sequence by description match: '{desc}' -> ID: '{seq_id}'")
                     break
-                    
-            # If not found, try matching just the first part (before space)
-            if not found and ' ' in node_name:
-                first_part = node_name.split()[0]
-                logger.debug(f"Trying to match by first part: {first_part}")
-                
-                # Keep track of all potential matches
-                potential_matches = []
-                
-                for seq_id, desc in self.sequence_list.descriptions.items():
-                    # Check if this description starts with the first part or the ID does
-                    if desc.startswith(first_part) or seq_id.startswith(first_part):
-                        potential_matches.append((seq_id, desc))
-                
-                # If we found exactly one match, use it
-                if len(potential_matches) == 1:
-                    sequence_id = potential_matches[0][0]
-                    found = True
-                    logger.info(f"Found unique match by first part: {first_part} -> {sequence_id}")
-                # If we found multiple matches, log them and use the first one
-                elif len(potential_matches) > 1:
-                    logger.warning(f"Found multiple matches by first part '{first_part}': {potential_matches}")
-                    # Use the first match
-                    sequence_id = potential_matches[0][0]
-                    found = True
-                    logger.info(f"Using first match: {sequence_id}")
-            
-            # If still not found, try a more fuzzy match based on contained strings
-            if not found:
-                logger.debug(f"Trying more fuzzy matches for: {node_name}")
-                
-                for seq_id, desc in self.sequence_list.descriptions.items():
-                    # Check if the node name is contained within the description or vice versa
-                    if (node_name in desc) or (desc in node_name):
-                        sequence_id = seq_id
-                        found = True
-                        logger.info(f"Found fuzzy match: '{node_name}' and '{desc}' -> {seq_id}")
-                        break
         
-        # Try even more advanced matching techniques if we still haven't found a match
-        if not sequence_id:
-            # Try to match by any part of the name as a last resort
-            for seq_id, sequence in self.sequence_list.sequences.items():
-                if node_name in seq_id or seq_id in node_name or (seq_id in self.sequence_list.descriptions and node_name in self.sequence_list.descriptions[seq_id]):
-                    sequence_id = seq_id
-                    logger.debug(f"Found loose match: {node_name} in {seq_id}")
-                    break
-             
-        # If we still can't find it, check the tree terminals directly
-        if not sequence_id and self.current_tree:
-            logger.debug("Trying to match directly with tree terminals")
-            for terminal in self.current_tree.get_terminals():
-                terminal_name = getattr(terminal, 'name', '')
-                
-                # Check for various forms of the name
-                is_match = False
-                
-                # Direct matches
-                if terminal_name == node_name:
-                    is_match = True
-                
-                # Handle duplicated names like "KX897432.1_KX897432.1" or "KX897432.1 KX897432.1"
-                elif '_' in terminal_name:
-                    parts = terminal_name.split('_')
-                    if len(parts) > 1 and parts[0] == parts[1] and parts[0] == node_name:
-                        is_match = True
-                
-                # Handle space-separated duplications
-                elif ' ' in terminal_name and ' ' in node_name:
-                    term_first = terminal_name.split()[0]
-                    node_first = node_name.split()[0]
-                    if term_first == node_first:
-                        # Check if terminal name has repeated segments
-                        if len(set(terminal_name.split())) < len(terminal_name.split()):
-                            is_match = True
-                
-                # Generic substring matching as a last resort
-                elif node_name in terminal_name or terminal_name in node_name:
-                    is_match = True
-                
-                if is_match:
-                    logger.debug(f"Found match in tree terminals: {terminal_name}")
-                    
-                    # Use this name to find the sequence
-                    for seq_id in self.sequence_list.sequences.keys():
-                        if terminal_name == seq_id or terminal_name in seq_id or seq_id in terminal_name:
-                            sequence_id = seq_id
-                            logger.debug(f"Matched tree terminal to sequence: {terminal_name} -> {seq_id}")
-                            break
-                    
-                    if sequence_id:
-                        break
-                    
-        # Last resort - if we have a tree but can't find the sequence, just return success anyway
-        # This allows deletion to work even when the matching algorithm fails
-        if not sequence_id and hasattr(self.tree_canvas, 'delete_mode') and self.tree_canvas.delete_mode:
-            logger.warning(f"Could not find exact sequence match for '{node_name}' but continuing with delete")
-            # Refresh the tree display anyway
-            self.tree_canvas.update()
+        # Secondary Search: If not found by description, try matching node_name
+        # with the sequence IDs (keys in self.sequence_list.sequences).
+        if sequence_id_to_delete is None:
+            if node_name in self.sequence_list.sequences:
+                sequence_id_to_delete = node_name
+                logger.debug(f"Found sequence by ID match: '{node_name}'")
+
+        if sequence_id_to_delete is None:
+            # If still not found after both primary and secondary search
+            # This block replaces the complex fallback logic that was previously here.
+            # The assumption is that node_name *should* be the full description.
+            logger.warning(f"Delete node: Could not find sequence corresponding to displayed name '{node_name}' in sequence list using primary (description) or secondary (ID) search.")
+            QMessageBox.warning(self, "Delete Failed", f"Could not find sequence data for node '{node_name}'. The sequence may have been modified or the name is inconsistent.")
             return
-            
-        if not sequence_id:
-            # Check if error suppression is requested or we're in delete mode
-            in_delete_mode = hasattr(self.tree_canvas, 'delete_mode') and self.tree_canvas.delete_mode
-            suppress_errors = hasattr(self, 'suppress_delete_errors') and self.suppress_delete_errors
-            
-            # Special handling for RaxML trees
-            is_raxml_tree = False
-            raxml_source_detected = False
-            
-            # First check if we have source information indicating this is a RaxML tree
-            if hasattr(self, 'tree_source') and self.tree_source == 'raxml':
-                is_raxml_tree = True
-                raxml_source_detected = True
-                logger.info("RaxML tree detected from tree_source attribute")
-                
-            # Also check tree properties if not already detected
-            if not raxml_source_detected and hasattr(self, 'current_tree') and self.current_tree:
-                # Check if this is likely a RaxML tree
-                if hasattr(self.current_tree, 'name') and self.current_tree.name:
-                    is_raxml_tree = "raxml" in str(self.current_tree.name).lower()
-                    if is_raxml_tree:
-                        logger.info("RaxML tree detected from tree name attribute")
-                
-                # If still not detected, check if tree was created with RaxML (looking for seq_X naming pattern)
-                if not is_raxml_tree:
-                    seq_name_pattern_count = 0
-                    for clade in self.current_tree.get_terminals():
-                        if clade.name and isinstance(clade.name, str) and (
-                            clade.name.startswith("seq") or 
-                            "seq_" in clade.name or 
-                            (clade.name.startswith("seq") and clade.name[3:].isdigit())
-                        ):
-                            seq_name_pattern_count += 1
-                            # If we find at least 3 matches, consider it a RAxML tree
-                            if seq_name_pattern_count >= 3:
-                                is_raxml_tree = True
-                                logger.info("RaxML tree detected from seq_X naming pattern")
-                                break
-            
-            # If this is a RaxML tree and we're in delete mode, create a temporary sequence
-            if is_raxml_tree and in_delete_mode:
-                # For RaxML trees, create a temporary ID based on the node name
-                # This allows deletion even when we can't find the exact sequence
-                logger.info(f"RaxML tree special handling for deletion: Using node name as temporary ID: {node_name}")
-                sequence_id = f"raxml_node_{node_name}"
-            elif not (in_delete_mode or suppress_errors or is_raxml_tree):
-                QMessageBox.warning(self, "Delete Failed", f"Could not find sequence '{node_name}' in the current dataset.")
-                logger.error(f"Failed to find sequence for node: {node_name}")
-                return
-            else:
-                # In delete mode, with suppressed errors, or RaxML tree - log and continue
-                logger.warning(f"Could not find sequence '{node_name}' in dataset (continuing anyway)")
-                
-                # Special case for RAxML trees: attempt to find an EXACT match only in node names
-                # We no longer do fuzzy matching to avoid accidentally deleting similar sequences
-                if self.current_tree and self.sequence_list.sequences:
-                    logger.debug("Attempting exact matching only for tree node")
-                    
-                    # First, try to see if this is possibly a name with location suffix
-                    if "_" in node_name:
-                        parts = node_name.split("_")
-                        if len(parts) > 1:
-                            # Extract the core name without location info
-                            base_name = parts[0]
-                            logger.debug(f"Checking if '{base_name}' is a base name in sequences")
-                            
-                            # Look for an exact match with the base name
-                            for seq_id in self.sequence_list.sequences.keys():
-                                if seq_id == base_name or seq_id.startswith(base_name + " "):
-                                    logger.info(f"Found exact base name match: '{base_name}' -> '{seq_id}'")
-                                    sequence_id = seq_id
-                                    break
-                    
-                    # If we still don't have a match, try direct equality only (no partial matches)
-                    if not sequence_id:
-                        for seq_id in self.sequence_list.sequences.keys():
-                            if seq_id == node_name:
-                                logger.info(f"Found exact match for node: '{node_name}' -> '{seq_id}'")
-                                sequence_id = seq_id
-                                break
-                
-                # If we still don't have a sequence_id, return silently
-                if not sequence_id:
-                    logger.debug("No matching sequence found, returning silently")
-                    return
-            
-        # Get the description for confirmation
-        current_desc = self.sequence_list.descriptions.get(sequence_id, sequence_id)
+
+        # Get the description for confirmation using the found sequence_id_to_delete
+        current_desc = self.sequence_list.descriptions.get(sequence_id_to_delete, sequence_id_to_delete)
         
         # Check if we're in delete mode from phylo_canvas
         in_delete_mode = hasattr(self.tree_canvas, 'delete_mode') and self.tree_canvas.delete_mode
@@ -2388,13 +2156,13 @@ PARAMETERS USED:
                 MainWindow.skip_delete_confirmation = True
         
         if reply == QMessageBox.StandardButton.Yes:
-            logger.info(f"Deleting sequence: ID={sequence_id}, Description={current_desc}")
+            logger.info(f"Deleting sequence: ID={sequence_id_to_delete}, Description={current_desc}")
             
             # Remove from sequence list
-            if sequence_id in self.sequence_list.sequences:
-                del self.sequence_list.sequences[sequence_id]
-            if sequence_id in self.sequence_list.descriptions:
-                del self.sequence_list.descriptions[sequence_id]
+            if sequence_id_to_delete in self.sequence_list.sequences:
+                del self.sequence_list.sequences[sequence_id_to_delete]
+            if sequence_id_to_delete in self.sequence_list.descriptions:
+                del self.sequence_list.descriptions[sequence_id_to_delete]
                 
             # Update the list widget
             self.sequence_list.rebuild_sequence_list()
@@ -2410,12 +2178,12 @@ PARAMETERS USED:
                 deleted_record = None
                 
                 for record in self.current_alignment:
-                    # Use EXACT match for sequence_id to avoid deleting similar sequences
-                    if record.id == sequence_id:
+                    # Use EXACT match for sequence_id_to_delete to avoid deleting similar sequences
+                    if record.id == sequence_id_to_delete:
                         logger.info(f"Removing exact match record from alignment: {record.id}")
                         deleted_record = record
-                    # Special case for when record.id is formatted differently from sequence_id
-                    elif hasattr(record, 'description') and record.description == current_desc:
+                    # Special case for when record.id is formatted differently from sequence_id_to_delete
+                    elif hasattr(record, 'description') and record.description == current_desc: # current_desc is from the node to be deleted
                         logger.info(f"Removing description match record from alignment: {record.id} (desc: {record.description})")
                         deleted_record = record
                     else:
@@ -2426,9 +2194,9 @@ PARAMETERS USED:
                     logger.info(f"Successfully removed record with ID: {deleted_record.id}")
                     # If no records were removed, that's an issue worth logging
                     if len(new_alignment) == len(self.current_alignment):
-                        logger.warning(f"No records were removed from alignment for sequence ID: {sequence_id}")
+                        logger.warning(f"No records were removed from alignment for sequence ID: {sequence_id_to_delete}")
                 else:
-                    logger.warning(f"No matching record found in alignment for sequence ID: {sequence_id}")
+                    logger.warning(f"No matching record found in alignment for sequence ID: {sequence_id_to_delete}")
                 
                 self.current_alignment = new_alignment
                 
@@ -2699,3 +2467,4 @@ PARAMETERS USED:
         # Determine format based on selected filter or file extension
         format_name = "fasta"  # Default format
         
+[end of treecraft/gui/main_window.py]

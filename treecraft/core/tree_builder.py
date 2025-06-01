@@ -9,6 +9,113 @@ from treecraft.utils.external_tools import find_external_tool, run_raxml, run_mr
 logger = logging.getLogger("treecraft.tree_builder")
 
 
+def _prepare_safe_alignment(alignment_input, escape_parentheses=False):
+    """
+    Creates a new alignment with safe sequence IDs (e.g., "seq_0", "seq_1")
+    and a map to restore original names. Optionally escapes parentheses in names.
+
+    Args:
+        alignment_input (Bio.Align.MultipleSeqAlignment or list of Bio.SeqRecord.SeqRecord):
+            The input alignment or list of sequences.
+        escape_parentheses (bool): If True, parentheses in descriptions will be
+                                   escaped (e.g., '(' -> '\\(').
+
+    Returns:
+        tuple: (list of Bio.SeqRecord.SeqRecord with safe IDs,
+                dict mapping safe_id -> original_description,
+                dict mapping escaped_description -> original_description if escape_parentheses is True else None)
+    """
+    from Bio.SeqRecord import SeqRecord
+
+    safe_alignment_records = []
+    id_map = {}  # Maps safe IDs to original full descriptions
+    parentheses_map = {} if escape_parentheses else None
+
+    for i, record in enumerate(alignment_input):
+        safe_id = f"seq_{i}"
+        original_description = record.description if record.description else record.id
+
+        if escape_parentheses and ('(' in original_description or ')' in original_description):
+            escaped_description = original_description.replace('(', '\\(').replace(')', '\\)')
+            if parentheses_map is not None: # Should always be true if escape_parentheses is true
+                parentheses_map[escaped_description] = original_description
+            id_map[safe_id] = escaped_description
+            # logger.debug(f"Escaped parentheses in name: '{original_description}' -> '{escaped_description}'") # Logger not passed here
+        else:
+            id_map[safe_id] = original_description
+
+        safe_record = SeqRecord(
+            record.seq,
+            id=safe_id,
+            description=""  # Clear description to avoid issues with some tools
+        )
+        safe_alignment_records.append(safe_record)
+
+    return safe_alignment_records, id_map, parentheses_map
+
+
+def _restore_terminal_names(tree, id_map, parentheses_map=None, raxml_style_suffix_handling=False):
+    """
+    Restores original names to terminal nodes of a tree.
+
+    Args:
+        tree (Bio.Phylo.BaseTree.Tree): The tree to modify.
+        id_map (dict): Maps safe_id -> original_description (or escaped_description).
+        parentheses_map (dict, optional): Maps escaped_description -> original_description.
+                                          Used to restore original parentheses.
+        raxml_style_suffix_handling (bool): If True, attempts to handle suffixes added by
+                                            tools like RAxML.
+    """
+    # Logger is defined at module level, can be used directly.
+    # import logging # Not needed here if logger is module level
+    # current_logger = logging.getLogger("treecraft.tree_builder._restore_terminal_names") # or use module logger
+
+    for terminal in tree.get_terminals():
+        original_name_found = False
+        current_name_to_check = terminal.name # Start with the name from the tree
+
+        if current_name_to_check in id_map:
+            restored_name = id_map[current_name_to_check]
+            logger.debug(f"Restoring name for '{current_name_to_check}' to '{restored_name}'")
+            terminal.name = restored_name
+            original_name_found = True
+        elif raxml_style_suffix_handling and "_" in current_name_to_check:
+            base_name = current_name_to_check.split("_")[0]
+            if base_name in id_map:
+                 restored_name = id_map[base_name]
+                 logger.info(f"Found RAxML-style match for '{current_name_to_check}' (using base '{base_name}') to '{restored_name}'")
+                 terminal.name = restored_name
+                 original_name_found = True
+            else:
+                for safe_id_prefix, mapped_name in id_map.items():
+                    if current_name_to_check.startswith(safe_id_prefix):
+                        logger.info(f"Found RAxML-style prefix match for '{current_name_to_check}' (using safe_id_prefix '{safe_id_prefix}') to '{mapped_name}'")
+                        terminal.name = mapped_name
+                        original_name_found = True
+                        break
+
+        if not original_name_found:
+             logger.warning(f"Could not find direct mapping for terminal: {terminal.name}. Name kept as is or altered by tool.")
+
+        # Parentheses restoration logic (applied to the potentially updated terminal.name)
+        name_after_initial_restore = terminal.name
+        if parentheses_map and name_after_initial_restore in parentheses_map:
+            original_with_parentheses = parentheses_map[name_after_initial_restore]
+            logger.debug(f"Restoring parentheses (direct match on escaped): '{name_after_initial_restore}' -> '{original_with_parentheses}'")
+            terminal.name = original_with_parentheses
+        elif '\\(' in name_after_initial_restore or '\\)' in name_after_initial_restore:
+            unescaped_name = name_after_initial_restore.replace('\\(', '(').replace('\\)', ')')
+            # Check if this unescaped version was an original value in parentheses_map
+            if parentheses_map and unescaped_name in parentheses_map.values():
+                logger.debug(f"Restoring parentheses (unescaped matched value): '{name_after_initial_restore}' -> '{unescaped_name}'")
+                terminal.name = unescaped_name
+            # Also check if unescaped_name is a value in id_map (could happen if original had escapes)
+            elif unescaped_name in id_map.values():
+                 # This case might be less common if parentheses_map is comprehensive
+                 logger.debug(f"Restoring parentheses (unescaped matched id_map value): '{name_after_initial_restore}' -> '{unescaped_name}'")
+                 terminal.name = unescaped_name
+
+
 def build_tree(alignment):
     """Build a phylogenetic tree using UPGMA method"""
     if len(alignment) < 2:
@@ -289,13 +396,13 @@ def build_nj_tree(alignment, distance_model="identity", bootstrap=False, bootstr
 def build_ml_tree(alignment, progress=None):
     """Build a phylogenetic tree using RAxML or MrBayes"""
     from Bio import Phylo, SeqIO
-    from Bio.SeqRecord import SeqRecord
-    import logging
-    import re
+    # Bio.SeqRecord is imported by _prepare_safe_alignment if needed.
+    # logging and re imports are not needed here as logger is module-level and re is unused.
     
-    logger = logging.getLogger("treecraft.tree_builder")
+    # logger is already defined at the module level.
     
     if len(alignment) < 4:
+        logger.warning("ML tree construction requires at least 4 sequences.")
         QMessageBox.warning(None, "Warning", "Need at least 4 sequences for ML tree construction")
         return None
     
@@ -304,6 +411,8 @@ def build_ml_tree(alignment, progress=None):
     mrbayes_path = find_external_tool("mb")
     
     if not raxml_path and not mrbayes_path:
+        logger.warning("Neither RAxML nor MrBayes found for ML tree construction.")
+        # QMessageBox logic remains for now.
         reply = QMessageBox.question(
             None, 
             "External Tool Required",
@@ -313,7 +422,6 @@ def build_ml_tree(alignment, progress=None):
         )
         
         if reply == QMessageBox.StandardButton.Yes:
-            # Provide instructions for installation
             QMessageBox.information(
                 None,
                 "Installation Instructions",
@@ -324,38 +432,11 @@ def build_ml_tree(alignment, progress=None):
             )
         return None
     
-    # Use safe sequence IDs for tree building and map them back to full names
-    safe_alignment = []
-    id_map = {}  # Maps safe IDs to original full descriptions
-    parentheses_map = {}  # Maps escaped parentheses back to original ones
-    
-    for i, record in enumerate(alignment):
-        # Create a safe ID without spaces for tree building
-        safe_id = f"seq_{i}"
-        
-        # Get the original description
-        original_description = record.description if record.description else record.id
-        
-        # Map the safe ID to the original record's full description
-        id_map[safe_id] = original_description
-        
-        # If the description contains parentheses, store a mapping with escaped parentheses
-        if '(' in original_description or ')' in original_description:
-            # Replace parentheses with escaped versions
-            escaped_description = original_description.replace('(', '\\(').replace(')', '\\)')
-            # Add mapping to restore the original
-            parentheses_map[escaped_description] = original_description
-            # Update id_map to store the escaped version
-            id_map[safe_id] = escaped_description
-            logger.debug(f"Escaped parentheses in name: '{original_description}' -> '{escaped_description}'")
-        
-        # Create new record with safe ID
-        safe_record = SeqRecord(
-            record.seq,
-            id=safe_id,
-            description=""
-        )
-        safe_alignment.append(safe_record)
+    # Prepare alignment with safe IDs and get mapping tables.
+    # Parentheses need to be escaped for Newick format if tools don't handle them.
+    safe_alignment_records, id_map, parentheses_map = _prepare_safe_alignment(alignment, escape_parentheses=True)
+    if parentheses_map:
+        logger.debug(f"Parentheses map created with {len(parentheses_map)} entries for ML tree build.")
     
     # Save alignment to temporary file
     temp_dir = tempfile.mkdtemp()
@@ -364,87 +445,50 @@ def build_ml_tree(alignment, progress=None):
     try:
         # Write sequences with safe IDs
         with open(temp_fasta, "w") as f:
-            for record in safe_alignment:
+            for record in safe_alignment_records: # Use the records from helper
                 f.write(f">{record.id}\n{record.seq}\n")
         
         # Run external tool (RAxML or MrBayes)
         if raxml_path:
+            logger.info(f"Running RAxML with alignment file: {temp_fasta} in dir: {temp_dir}")
             run_raxml(temp_dir, temp_fasta, progress)
-        else:
+        elif mrbayes_path: # Explicitly check mrbayes_path
+            logger.info(f"Running MrBayes with alignment file: {temp_fasta} in dir: {temp_dir}")
             run_mrbayes(temp_dir, temp_fasta, progress)
+        else:
+            # This case should ideally be caught by earlier checks, but good for robustness.
+            logger.error("No ML tool (RAxML or MrBayes) path available to run.")
+            QMessageBox.critical(None, "Error", "Configuration error: No ML tool specified to run.")
+            return None
             
         # Load resulting tree
         tree_file = find_tree_file(temp_dir)
         if tree_file:
-            # Read tree with safe IDs
+            logger.info(f"ML tree construction successful. Tree file found: {tree_file}")
+            # Read tree with (potentially) safe IDs
             tree = Phylo.read(tree_file, "newick")
             
-            # Replace safe IDs with full descriptions in the tree
-            for terminal in tree.get_terminals():
-                if terminal.name in id_map:
-                    original_name = id_map[terminal.name]
-                    logger.debug(f"Restoring name from '{terminal.name}' to '{original_name}'")
-                    terminal.name = original_name
-                    logger.debug(f"Restored full name in ML tree: {terminal.name}")
-                else:
-                    # For RAxML trees, they may include location suffixes with underscores
-                    # Try to find a match by checking if the name starts with a known prefix
-                    found = False
-                    if "_" in terminal.name:
-                        base_name = terminal.name.split("_")[0]
-                        for safe_id, full_name in id_map.items():
-                            # Try different matching strategies to find the full name
-                            if (safe_id.startswith(base_name) or 
-                                terminal.name.startswith(safe_id) or
-                                base_name in full_name or
-                                any(part in full_name for part in terminal.name.split("_"))):
-                                logger.info(f"Found match: {terminal.name} -> {full_name}")
-                                terminal.name = full_name
-                                found = True
-                                break
-                    
-                    # Extended search if not found with prefix
-                    if not found:
-                        # Look for fragments of the terminal name in full names
-                        for safe_id, full_name in id_map.items():
-                            # Check if any word in terminal name appears in the full name
-                            if terminal.name in full_name or any(part in full_name for part in terminal.name.split("_")):
-                                logger.info(f"Found partial match by content: {terminal.name} -> {full_name}")
-                                terminal.name = full_name
-                                found = True
-                                break
-                    
-                    if not found:
-                        logger.warning(f"Could not find mapping for terminal: {terminal.name}")
-            
-            # Now restore any escaped parentheses to their original form
-            for terminal in tree.get_terminals():
-                if terminal.name in parentheses_map:
-                    original_with_parentheses = parentheses_map[terminal.name]
-                    logger.debug(f"Restoring parentheses: '{terminal.name}' -> '{original_with_parentheses}'")
-                    terminal.name = original_with_parentheses
-                # Handle case where RAxML kept the escaped parentheses (backslashes may be present)
-                elif '\\(' in terminal.name or '\\)' in terminal.name:
-                    # Create a version with normal parentheses for comparison
-                    unescaped = terminal.name.replace('\\(', '(').replace('\\)', ')')
-                    if unescaped in parentheses_map.values():
-                        logger.debug(f"Restoring from escaped sequence: '{terminal.name}' -> '{unescaped}'")
-                        terminal.name = unescaped
+            # Restore original terminal names, handling RAxML suffixes and escaped parentheses
+            _restore_terminal_names(tree, id_map, parentheses_map, raxml_style_suffix_handling=True)
             
             return tree
         else:
-            QMessageBox.warning(None, "Warning", "No tree file generated")
+            logger.warning("ML tree construction did not produce a recognizable tree file.")
+            QMessageBox.warning(None, "Warning", "No tree file generated by the ML tool.")
             return None
             
     except Exception as e:
+        logger.error(f"Failed to build ML tree: {str(e)}", exc_info=True) # Add exc_info for traceback
         QMessageBox.critical(None, "Error", f"Failed to build ML tree: {str(e)}")
         return None
     finally:
         # Clean up
         try:
+            logger.debug(f"Cleaning up temporary directory: {temp_dir}")
             shutil.rmtree(temp_dir)
-        except:
-            pass
+        except Exception as e: # Catch specific exceptions if possible, e.g., OSError
+            logger.error(f"Error cleaning up temporary directory {temp_dir}: {str(e)}")
+            # pass # Avoid silent pass if possible, log instead.
 
 
 

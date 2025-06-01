@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QWidget, QScrollArea, QPushButton, QHBoxLayout, QVBoxLayout, QFrame, QMenu, QInputDialog, QFontDialog
+from PyQt6.QtWidgets import QWidget, QScrollArea, QPushButton, QHBoxLayout, QVBoxLayout, QFrame, QMenu, QInputDialog, QFontDialog, QStyle
 from PyQt6.QtGui import QPainter, QPen, QColor, QFont, QIcon, QTransform, QFontMetrics, QCursor
 from PyQt6.QtCore import Qt, QRect, QPoint, QSize, pyqtSignal, QTimer
 
@@ -2771,13 +2771,27 @@ class PhyloCanvas(QScrollArea):
         # Instead, we'll style each button to provide helpful tooltips
         
         # Create delete button (proper trashcan icon)
-        self.delete_btn = QPushButton("🗑️")  # Emoji with variation selector for better trash can icon
+        self.delete_btn = QPushButton() # Create empty button first
         self.delete_btn.setToolTip("Delete Mode\nClick here then click on sequences to delete them")
         self.delete_btn.setFixedSize(30, 30)
-        self.delete_btn.setStyleSheet("font-size: 20px; font-weight: bold; border-radius: 4px;")  # Use default background color
-        self.delete_btn.setCheckable(True)  # Make it toggleable
+        self.delete_btn.setCheckable(True)
         self.delete_btn.clicked.connect(self.toggle_delete_mode)
-        
+
+        trash_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon)
+        if not trash_icon.isNull(): # Check if the icon is valid
+            self.delete_btn.setIcon(trash_icon)
+            self.delete_btn.setText("") # Clear any text
+            # self.delete_btn.setIconSize(QSize(20,20)) # Optional: Adjust icon size if needed
+            self.delete_btn.setStyleSheet("border-radius: 4px;") # Minimal styling for icon button
+        else:
+            logger.warning("SP_TrashIcon is null, using text 'Del' for delete button.")
+            self.delete_btn.setText("Del")
+            del_font = QFont("Arial", 10)
+            del_font.setBold(True)
+            self.delete_btn.setFont(del_font)
+            self.delete_btn.setIcon(QIcon()) # Clear icon just in case
+            self.delete_btn.setStyleSheet("font-weight: bold; border-radius: 4px;")
+
         # Create reroot button
         self.reroot_btn = QPushButton("⚠")  # Using a root-like symbol
         self.reroot_btn.setToolTip("Reroot Tree\nClick here then click on a branch to make it the new root")
