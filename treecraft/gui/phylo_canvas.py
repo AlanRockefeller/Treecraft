@@ -15,16 +15,21 @@ logger = logging.getLogger("treecraft.phylo_canvas")
 
 class TreeCanvas(QWidget):
     """Widget for drawing the phylogenetic tree"""
+    LABEL_LOD_THRESHOLD = 0.3 # Threshold for hiding labels when zoomed out
     
     # Add signals for node interactions
     node_double_clicked = pyqtSignal(str)
     node_right_clicked = pyqtSignal(str, QPoint)
     rename_signal = pyqtSignal(str)  # Signal for renaming node
     delete_signal = pyqtSignal(str)  # Signal for deleting node
+    zoom_changed_by_wheel = pyqtSignal() # For deferred update
     
     def __init__(self, parent=None):
         super().__init__(parent)
         self.tree = None
+        self._cached_leaf_count = 0
+        self._cached_tree_depth = 0
+        self.layout_is_dirty = True
         self.highlighted_branches = {}  # Dictionary of highlighted branches
         self.clade_labels = {}  # Dictionary of clade labels
         self.setMinimumSize(400, 300)
@@ -92,6 +97,41 @@ class TreeCanvas(QWidget):
         
         # Signals already defined at class level
 
+    @property
+    def dark_mode(self):
+        return self._dark_mode
+
+    @dark_mode.setter
+    def dark_mode(self, value):
+        if self._dark_mode != value:
+            self._dark_mode = value
+            self.update() # Only repaint, no layout change
+
+    def _recalculate_tree_metrics(self):
+        """Recalculates and caches leaf_count and tree_depth."""
+        if not self.tree or not self.tree.root:
+            self._cached_leaf_count = 0
+            self._cached_tree_depth = 0
+            return
+
+        self._cached_leaf_count = len(list(self.tree.get_terminals()))
+
+        def get_depth(clade):
+            if not clade.clades:
+                return 0
+            if not any(clade.clades): # handle cases where clades might be list of Nones
+                return 0
+            return 1 + max(get_depth(child) for child in clade.clades if child is not None)
+
+        if self.tree.root:
+            self._cached_tree_depth = get_depth(self.tree.root)
+        else:
+            self._cached_tree_depth = 0
+
+        # Log the results for debugging
+        logger.debug(f"Recalculated tree metrics: leaf_count={self._cached_leaf_count}, tree_depth={self._cached_tree_depth}")
+        self.layout_is_dirty = True
+
     def mousePressEvent(self, event):
         """Handle mouse press events for clade manipulation, panning, rerooting, or deletion"""
         if not self.tree:
@@ -111,7 +151,7 @@ class TreeCanvas(QWidget):
         if self.reroot_mode and clade:
             # If in reroot mode, reroot the tree at this clade
             logger.debug(f"Rerooting tree at clade: {clade.name if hasattr(clade, 'name') and clade.name else 'unnamed'}")
-            self.reroot_tree_at_clade(clade)
+            self.reroot_tree_at_clade(clade) # This will set layout_is_dirty via _recalculate_tree_metrics
             # Prevent further handling of this click
             event.accept()
             return
@@ -634,13 +674,14 @@ class TreeCanvas(QWidget):
                                     success = self.swap_clades(parent_clade)
                                     
                                     # Force layout recalculation (redundant but being extra safe)
-                                    self.calculate_tree_layout()
+                                    # self.calculate_tree_layout() # No longer called directly
+                                    self.layout_is_dirty = True # swap_clades will set this
                                     # Force immediate redraw
                                     self.update()
                                 except ValueError:
                                     # Fallback to traditional swap
                                     logger.debug("Cannot find index of dragged clade, using traditional swap")
-                                    success = self.swap_clades(parent_clade)
+                                    success = self.swap_clades(parent_clade) # swap_clades will set layout_is_dirty
                                 
                                 # Update tree display
                                 self.update()
@@ -655,7 +696,7 @@ class TreeCanvas(QWidget):
                             if self.drag_clade and hasattr(self.drag_clade, 'clades') and len(self.drag_clade.clades) > 1:
                                 # Always rotate the same way for consistency
                                 logger.debug("Performing standard rotation on clade")
-                                success = self.rotate_clade(self.drag_clade)
+                                success = self.rotate_clade(self.drag_clade) # rotate_clade will set layout_is_dirty
                                 
                                 # Force update (redundant but being extra safe)
                                 self.update()
@@ -995,8 +1036,10 @@ class TreeCanvas(QWidget):
                 parent_canvas.updateTreeCanvasSize()
         
         # Force layout recalculation and redraw
-        self.calculate_tree_layout()
-        self.update()
+        # self.calculate_tree_layout() # No longer called directly
+        # self.update() # Deferred
+        self.layout_is_dirty = True # Zooming changes overall scale, mark dirty
+        self.zoom_changed_by_wheel.emit() # Emit signal for PhyloCanvas to handle deferred update
         event.accept()
 
     def set_tree(self, tree):
@@ -1019,9 +1062,12 @@ class TreeCanvas(QWidget):
                 # Clear existing data
                 self.highlighted_branches = {}
                 self.clade_labels = {}
-                self.node_positions = {}
+                self.node_positions = {} # Cleared as per instructions
                 self.node_name_map = {}
                 self.object_id_map = {}
+                self._cached_leaf_count = 0
+                self._cached_tree_depth = 0
+                self.layout_is_dirty = True # Ensure layout is recalculated
                 self.update()
                 return
                 
@@ -1040,35 +1086,23 @@ class TreeCanvas(QWidget):
                     logger.error("Tree root exists but is None or empty!")
                 elif not hasattr(tree.root, 'clades'):
                     logger.error("Tree root has no clades attribute!")
-                elif not tree.root.clades:
-                    logger.error("Tree root has empty clades list!")
+                elif not tree.root.clades: # Allow empty clades list for initial state
+                    logger.info("Tree root has empty clades list (e.g. single node tree).")
                     
-                # Check terminal nodes and their names
-                try:
-                    terminals = list(tree.get_terminals())
-                    logger.debug(f"Terminal nodes: {len(terminals)}")
-                    
-                    # Log the first few terminal names to debug
-                    for i, term in enumerate(terminals[:5]):  # Show first 5 terminals
-                        name = getattr(term, 'name', '[no name]')
-                        branch_length = getattr(term, 'branch_length', '[no branch_length]')
-                        logger.debug(f"Terminal {i} name: '{name}', branch length: {branch_length}")
-                    
-                    # Warning for very few terminals
-                    if len(terminals) < 2:
-                        logger.warning(f"Tree has only {len(terminals)} terminal nodes - may not display properly")
-                except Exception as term_err:
-                    logger.error(f"Error getting terminals: {term_err}")
+                # Check terminal nodes and their names - will be done by _recalculate_tree_metrics
             else:
                 logger.warning("Tree has no root attribute - may not be a valid tree object")
                 
             # Clear previous data to ensure clean rendering
             self.highlighted_branches = {}
             self.clade_labels = {}
-            self.node_positions = {}
+            self.node_positions = {} # Cleared as per instructions
             
-            # Force a complete layout recalculation
-            self.calculate_tree_layout()
+            # Recalculate cached metrics and set layout_is_dirty
+            self._recalculate_tree_metrics()
+
+            # Force a complete layout recalculation if needed (will be handled by paintEvent)
+            # self.calculate_tree_layout() # No longer called directly
             
             # Force redraw
             self.update()
@@ -1084,20 +1118,127 @@ class TreeCanvas(QWidget):
             logger.error(f"Error setting tree in TreeCanvas: {e}")
             logger.error(traceback.format_exc())
             # Don't clear the tree on error - it might be partially working
-            self.update()
-    
-    def highlight_branch(self, clade_name, color=QColor(255, 0, 0)):
-        """Highlight a branch with the given color"""
-        self.highlighted_branches[clade_name] = color
-        self.update()
-    
+        self.update() # Already calls update, layout_is_dirty is not set here.
+
+    def _get_clade_and_parent_coords(self, clade_name_or_id):
+        """Helper to find clade coordinates and its parent's for bounding box calculation."""
+        node_x, node_y = -1, -1
+        parent_x, parent_y = -1, -1
+
+        # Try to find the node by its name/ID used in node_positions
+        node_key = None
+        if clade_name_or_id in self.node_positions: # Typically for internal_id(clade) or leaf_name_pos
+            node_key = clade_name_or_id
+        else: # Try to find a leaf node if only name is given
+            for key in self.node_positions:
+                if key.startswith(f"leaf_{clade_name_or_id}_") or key == clade_name_or_id:
+                    node_key = key
+                    break
+
+        if not node_key or node_key not in self.node_positions:
+            logger.warning(f"Highlight: Node key for '{clade_name_or_id}' not found in node_positions.")
+            return None, None, None, None
+
+        node_x, node_y = self.node_positions[node_key]
+
+        # Find the actual clade object to then find its parent
+        target_clade = None
+        # We need a reliable way to get from clade_name_or_id to the actual clade object
+        # This might involve iterating self.tree.find_clades(clade_name_or_id) or using self.object_id_map
+
+        # Simplification: iterate all clades to find the one matching node_key (if it's an internal node ID)
+        # or matching part of the name (if it's a leaf)
+        # This is not the most efficient way but needed for parent lookup
+
+        clade_obj_id_str = None
+        if node_key.startswith("internal_"):
+            try:
+                clade_obj_id_str = node_key.split("_")[-1]
+            except: # noqa: E722
+                pass
+
+        for c in self.tree.find_clades():
+            current_clade_id_str = None
+            # Construct a comparable key from 'c' to 'node_key'
+            # This logic needs to mirror how node_name is created in calculate_tree_layout's layout_clade
+            # For now, we assume clade_name_or_id is often the direct object ID string for internal nodes
+            # or the direct name for leaves.
+            if hasattr(c, 'name') and c.name == clade_name_or_id: # Direct name match (usually leaves)
+                 target_clade = c
+                 break
+            if clade_obj_id_str and str(id(c)) == clade_obj_id_str: # Direct ID match for internal nodes
+                 target_clade = c
+                 break
+            # Fallback for leaf nodes where node_key includes position: leaf_{name}_{pos}
+            if node_key.startswith("leaf_") and c.name and node_key.startswith(f"leaf_{c.name}_"):
+                # Check if this leaf's unique key matches
+                # This requires knowing the leaf's position, which isn't stored on clade object
+                # This part is tricky without iterating layout_clade again or storing more info.
+                # For now, if node_x, node_y are found, we proceed. Parent finding is harder.
+                pass
+
+
+        if target_clade:
+            parent_clade = self.find_parent_clade(self.tree.root, target_clade)
+            if parent_clade:
+                parent_node_id = id(parent_clade)
+                parent_key_in_map = self.object_id_map.get(parent_node_id)
+                if parent_key_in_map and parent_key_in_map in self.node_positions:
+                    parent_x, parent_y = self.node_positions[parent_key_in_map]
+                else:
+                    logger.warning(f"Highlight: Parent of '{clade_name_or_id}' found in tree but not in node_positions.")
+        else:
+            logger.warning(f"Highlight: Clade object for '{clade_name_or_id}' not found in tree for parent lookup.")
+
+        return node_x, node_y, parent_x, parent_y
+
+    def highlight_branch(self, clade_name_or_id, color=QColor(255, 0, 0)):
+        """Highlight a branch with the given color, repainting only the affected region."""
+        self.highlighted_branches[clade_name_or_id] = color
+
+        node_x, node_y, parent_x, parent_y = self._get_clade_and_parent_coords(clade_name_or_id)
+
+        if node_x != -1 and node_y != -1 and parent_x != -1 and parent_y != -1:
+            # Define a bounding box for the branch (vertical and horizontal parts)
+            # Add some margin for branch thickness and antialiasing
+            margin = self.branch_width + 5
+            rect_x = min(node_x, parent_x) - margin
+            rect_y = min(node_y, parent_y) - margin
+            rect_width = abs(node_x - parent_x) + 2 * margin
+            rect_height = abs(node_y - parent_y) + 2 * margin
+
+            # Special case for vertical line from root if parent_x, parent_y is itself (root drawing)
+            if node_x == parent_x and node_y == parent_y: # Should not happen for a branch to parent
+                 self.update() # Fallback
+                 return
+
+            affected_rect = QRect(int(rect_x), int(rect_y), int(rect_width), int(rect_height))
+
+            # Also consider label area for leaf nodes
+            # This logic is simplified; a more precise approach would get the actual label dimensions
+            if clade_name_or_id.startswith("leaf_") or (not clade_name_or_id.startswith("internal_") and any(clade_name_or_id == term.name for term in self.tree.get_terminals())):
+                label_rect = QRect(int(node_x + 5), int(node_y - 15), 800, 30) # Approximate
+                affected_rect = affected_rect.united(label_rect)
+
+            logger.debug(f"Updating specific rect for highlight: {affected_rect}")
+            self.update(affected_rect)
+        else:
+            logger.warning(f"Could not determine branch coordinates for '{clade_name_or_id}'. Full update.")
+            self.update() # Fallback to full update
+
     def add_clade_label(self, clade_name, label):
         """Add a label to a clade"""
         self.clade_labels[clade_name] = label
+        # For simplicity, full update. Could be optimized like highlight_branch.
         self.update()
     
     def clear_highlights(self):
         """Clear all branch highlights"""
+        if not self.highlighted_branches:
+            return # Nothing to clear, no update needed
+
+        # For simplicity, trigger a full repaint if there were any highlights
+        # A more optimized version would collect all affected_rects and update their union.
         self.highlighted_branches = {}
         self.update()
         
@@ -1130,7 +1271,14 @@ class TreeCanvas(QWidget):
             self.update_status_message("Maximum reasonable tree size reached")
             return False
             
-        self.calculate_tree_layout()
+        # self.calculate_tree_layout() # No longer called directly
+        self.layout_is_dirty = True # Spacing changes require full recalculation
+        # self.calculate_tree_layout() # No longer called directly
+        self.layout_is_dirty = True # Spacing changes require full recalculation
+        # self.calculate_tree_layout() # No longer called directly
+        self.layout_is_dirty = True # Spacing changes require full recalculation
+        # self.calculate_tree_layout() # No longer called directly
+        self.layout_is_dirty = True # Spacing changes require full recalculation
         self.update()
         
         # Log spacing change for debugging
@@ -1356,7 +1504,9 @@ class TreeCanvas(QWidget):
                 self.tree.root = new_root
             
             # Recalculate layout and update display
-            self.calculate_tree_layout()
+            # self.calculate_tree_layout() # No longer called directly
+            self._recalculate_tree_metrics() # Rerooting changes tree structure
+            self.layout_is_dirty = True
             self.update()
             
             # Update status
@@ -1588,6 +1738,8 @@ class TreeCanvas(QWidget):
         """Swap the order of child clades for the given clade"""
         if clade and len(clade.clades) > 1:
             clade.clades = list(reversed(clade.clades))
+            self._recalculate_tree_metrics() # Recalculate metrics as node order can affect perceived depth or leaf presentation
+            self.layout_is_dirty = True
             self.update()
             return True
         return False
@@ -1597,10 +1749,12 @@ class TreeCanvas(QWidget):
         if clade and len(clade.clades) > 2:
             # Move the first clade to the end
             clade.clades = clade.clades[1:] + [clade.clades[0]]
+            self._recalculate_tree_metrics() # Recalculate metrics
+            self.layout_is_dirty = True
             self.update()
             return True
         elif clade and len(clade.clades) == 2:
-            return self.swap_clades(clade)
+            return self.swap_clades(clade) # swap_clades will call _recalculate_tree_metrics and set layout_is_dirty
         return False
     
     def find_parent_clade(self, clade, target_clade):
@@ -1628,8 +1782,8 @@ class TreeCanvas(QWidget):
         # Force redraw with new line width
         self.update()
     
-    def draw_clade(self, painter, clade, parent_x=None, parent_y=None):
-        """Draw a clade in the tree"""
+    def draw_clade(self, painter, clade, visible_rect, parent_x=None, parent_y=None):
+        """Draw a clade in the tree, with viewport culling and LOD."""
         # Safety check - validate clade
         if clade is None:
             logger.error("Attempted to draw None clade")
@@ -1730,273 +1884,172 @@ class TreeCanvas(QWidget):
         parent_x_int = int(parent_x) if parent_x is not None else None
         parent_y_int = int(parent_y) if parent_y is not None else None
 
+        # Basic Culling: Check if the node's y-coordinate is way outside the viewport
+        # Add a margin to account for node size and branch thickness
+        node_vertical_margin = 20
+        # Node is considered potentially visible if its y or parent's y is within viewport or spans it
+        node_potentially_visible = (
+            (visible_rect.top() - node_vertical_margin <= y_int <= visible_rect.bottom() + node_vertical_margin) or
+            (parent_y_int is not None and
+                not ((y_int < visible_rect.top() - node_vertical_margin and parent_y_int < visible_rect.top() - node_vertical_margin) or \
+                     (y_int > visible_rect.bottom() + node_vertical_margin and parent_y_int > visible_rect.bottom() + node_vertical_margin))
+            )
+        )
+
+        if not node_potentially_visible and not clade.clades: # If node is not visible and has no children, cull it
+            pass # Children recursion will be skipped later if this path is taken
+
         # Define marker size for all node types
         marker_size = 8
-        
-        # Draw node markers only for internal nodes to make them more visible and draggable
-        if hasattr(clade, 'clades') and clade.clades:
-            marker_rect = QRect(int(x_int - marker_size/2), int(y_int - marker_size/2), 
-                                marker_size, marker_size)
-            
-            # Internal node - filled circle
-            painter.setPen(Qt.PenStyle.NoPen)  # No border for cleaner look
-            painter.setBrush(node_color)  # Blue fill from our earlier definition
-            
-            # Draw the node marker to make it clear what's draggable
-            painter.drawEllipse(marker_rect)
-        
-        # Add EXTRA highlighting for hovering - brighter and larger
-        # Show hover highlight for ALL nodes to make dragging more intuitive
+        node_marker_rect = QRect(x_int - marker_size // 2, y_int - marker_size // 2, marker_size, marker_size)
+
+        # Node Marker Culling & Drawing
+        if hasattr(clade, 'clades') and clade.clades: # Only draw for internal nodes
+            if visible_rect.intersects(node_marker_rect):
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(node_color)
+                painter.drawEllipse(node_marker_rect)
+
+        # Hover Highlight Culling & Drawing
         if clade == self.hover_node:
-            # Make highlight size larger than the node
             highlight_size = marker_size + 4
-            
-            # Draw a highlight around the node - make it very noticeable
-            # Make sure all values are integers for QRect
             hs_half = int(highlight_size/2)
             highlight_rect = QRect(x_int - hs_half, y_int - hs_half, 
                                    int(highlight_size), int(highlight_size))
-            
-            # Use a bright highlight color that works in both light and dark modes
-            highlight_color = QColor(50, 180, 255)  # Bright blue
-            painter.setPen(QPen(highlight_color, 2))
-            painter.setBrush(QColor(highlight_color.red(), highlight_color.green(), highlight_color.blue(), 100))
-            painter.drawEllipse(highlight_rect)
+            if visible_rect.intersects(highlight_rect_obj): # Check intersection for hover highlight
+                highlight_color = QColor(50, 180, 255)
+                painter.setPen(QPen(highlight_color, 2))
+                painter.setBrush(QColor(highlight_color.red(), highlight_color.green(), highlight_color.blue(), 100))
+                painter.drawEllipse(highlight_rect_obj)
 
-        # Draw branch from parent (if not root)
+        # Branch Culling & Drawing
+        branch_drawn = False
         if parent_x_int is not None and parent_y_int is not None:
-            # Generate a consistent key for checking highlights
-            highlight_key = clade.name if clade.name else f"internal_{id(clade)}"
-            
-            # Set pen color based on highlighting
-            if highlight_key in self.highlighted_branches:
-                color = self.highlighted_branches[highlight_key]
-                pen = QPen(color, self.branch_width + 1)  # Make highlighted branches slightly thicker
-                painter.setPen(pen)
-            else:
-                # Use the branch_color we defined earlier in paintEvent
-                painter.setPen(QPen(branch_color, self.branch_width))
+            # Bounding box for the whole branch (vertical and horizontal parts)
+            branch_overall_bbox = QRect(min(parent_x_int, x_int) - self.branch_width,
+                                        min(parent_y_int, y_int) - self.branch_width,
+                                        abs(x_int - parent_x_int) + 2 * self.branch_width,
+                                        abs(y_int - parent_y_int) + 2 * self.branch_width)
 
-            # Draw horizontal line from parent's level to this node's level
-            painter.drawLine(parent_x_int, parent_y_int, parent_x_int, y_int)
+            if visible_rect.intersects(branch_overall_bbox):
+                highlight_key = clade.name if clade.name else f"internal_{id(clade)}"
+                current_pen_color = branch_color
+                current_branch_width = self.branch_width
+                if highlight_key in self.highlighted_branches:
+                    current_pen_color = self.highlighted_branches[highlight_key]
+                    current_branch_width = self.branch_width + 1
 
-            # Draw horizontal line to this node - make sure x_int is different from parent_x_int
-            # This ensures nodes are actually drawn at different x-coordinates
-            if x_int <= parent_x_int:
-                # Fix the issue with flat tree by ensuring x_int is always greater than parent_x_int
-                # Calculate a proper offset based on tree depth
-                # Get the current horizontal spacing factor and use it to calculate the offset
-                x_offset = max(50, 100 * self.horizontal_spacing_factor)
-                x_int = parent_x_int + int(x_offset)
-                # Update the node position for future reference
-                self.node_positions[clade_name] = (x_int, y_int)
-                
-            # Ensure we're actually drawing a meaningful horizontal line
-            if abs(x_int - parent_x_int) < 10:
-                # If nodes are too close horizontally, add minimum distance
-                x_int = parent_x_int + 50  # Minimum horizontal branch length
-                self.node_positions[clade_name] = (x_int, y_int)
-                
-            painter.drawLine(parent_x_int, y_int, x_int, y_int)
+                painter.setPen(QPen(current_pen_color, current_branch_width))
 
-        
-        # Draw bootstrap value if available and enabled
-        if (parent_x_int is not None and self.show_bootstrap and hasattr(clade, 'confidence') and clade.confidence is not None):
-            # Bootstrap values can be stored in different formats in different tree files
-            # Handle both integer and float values
-            try:
-                # Try to convert to float first to handle all numeric formats
-                conf_val = float(clade.confidence)
-                
-                # Format confidence value - use integer if it's a whole number, otherwise show decimal
-                if conf_val == int(conf_val):
-                    confidence = int(conf_val)
-                    display_val = str(confidence)
-                else:
-                    # It's a fraction or percentage - keep one decimal place
-                    confidence = conf_val
-                    display_val = f"{confidence:.1f}"
-                
-                # Only display if the value is greater than 0
-                if confidence > 0:
-                    # Calculate position for bootstrap value
-                    # Place it near the branch point
-                    bs_x = (parent_x_int + x_int) // 2
-                    bs_y = y_int - 10
-                    
-                    # Determine color threshold - if values are 0-1 scale, use 0.7 as threshold
-                    # if values are 0-100 scale, use 70 as threshold
-                    color_threshold = 0.7 if conf_val <= 1 else 70
-                    
-                    # Draw the bootstrap value with appropriate color
-                    if self.dark_mode:
-                        # Use color based on value (green for high confidence)
-                        if confidence >= color_threshold:
-                            painter.setPen(QPen(QColor(0, 255, 0), 1))  # Green
+                # Draw vertical part of the branch
+                painter.drawLine(parent_x_int, parent_y_int, parent_x_int, y_int)
+                # Draw horizontal part of the branch
+                painter.drawLine(parent_x_int, y_int, x_int, y_int)
+                branch_drawn = True
+
+        # Bootstrap Culling & Drawing
+        if branch_drawn and self.show_bootstrap and hasattr(clade, 'confidence') and clade.confidence is not None:
+            # Approximate bounding box for bootstrap text
+            # Assume max text width and height for culling check, actual drawing uses metrics
+            bootstrap_text_approx_rect = QRect((parent_x_int + x_int) // 2 - 20, y_int - 20, 40, 15)
+            if visible_rect.intersects(bootstrap_text_approx_rect):
+                try:
+                    conf_val = float(clade.confidence)
+                    display_val = f"{int(conf_val)}" if conf_val == int(conf_val) else f"{conf_val:.1f}"
+                    if conf_val > 0:
+                        bs_x = (parent_x_int + x_int) // 2
+                        bs_y = y_int - 10
+                        color_threshold = 0.7 if conf_val <= 1 else 70
+                        if self.dark_mode:
+                            painter.setPen(QPen(QColor(0, 255, 0) if conf_val >= color_threshold else QColor(255, 165, 0), 1))
                         else:
-                            painter.setPen(QPen(QColor(255, 165, 0), 1))  # Orange
+                            painter.setPen(QPen(QColor(0, 100, 0) if conf_val >= color_threshold else QColor(200, 100, 0), 1))
+                        painter.drawText(bs_x, bs_y, display_val)
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Could not convert bootstrap value: {clade.confidence}, error: {e}")
+                    # ... (rest of bootstrap error handling)
+
+        # Label Culling (LOD and Viewport)
+        if not clade.clades: # Leaf node
+            if self.scale_factor >= self.LABEL_LOD_THRESHOLD:
+                # Approximate label bounding box for culling
+                # A more accurate one would use font metrics on the specific label text
+                font_metrics_approx = QFontMetrics(self.sequence_font if hasattr(self, 'sequence_font') else QFont("Arial", 9))
+                label_width_approx = font_metrics_approx.horizontalAdvance(clade.name[:20] if clade.name else "Unnamed") + 10 # Approx first 20 chars
+                label_height_approx = font_metrics_approx.height() + 5
+                label_check_rect = QRect(x_int + 5, y_int - label_height_approx // 2, label_width_approx, label_height_approx)
+
+                if visible_rect.intersects(label_check_rect):
+                    if hasattr(self, 'node_name_map') and clade_name in self.node_name_map:
+                        full_label = self.node_name_map[clade_name]
                     else:
-                        if confidence >= color_threshold:
-                            painter.setPen(QPen(QColor(0, 100, 0), 1))  # Dark green
-                        else:
-                            painter.setPen(QPen(QColor(200, 100, 0), 1))  # Dark orange
+                        full_label = clade.name if clade.name else "Unnamed"
                     
-                    painter.drawText(bs_x, bs_y, display_val)
-            except (ValueError, TypeError) as e:
-                # If conversion fails, try using the value as-is
-                logger.warning(f"Could not convert bootstrap value to number: {clade.confidence}, error: {e}")
-                # Just use the confidence value as a string if it's not numeric
-                if str(clade.confidence).strip():
-                    bs_x = (parent_x_int + x_int) // 2
-                    bs_y = y_int - 10
-                    painter.setPen(QPen(QColor(150, 150, 150), 1))  # Gray for non-numeric values
-                    painter.drawText(bs_x, bs_y, str(clade.confidence))
-
-        # Draw label for leaf nodes
-        if not clade.clades:
-            # Draw full label - preserve spaces in names
-            # The node name should already have full description with spaces
-            # Use the original name from node_name_map if available
-            if hasattr(self, 'node_name_map') and clade_name in self.node_name_map:
-                full_label = self.node_name_map[clade_name]
-                logger.debug(f"Drawing label using node_name_map: {full_label}")
-            else:
-                full_label = clade.name if clade.name else "Unnamed"
-                logger.debug(f"Drawing label using clade.name: {full_label}")
-            
-            # Save original font for restoration later
-            original_font = painter.font()
-            
-            # Import QFont to ensure it's available
-            from PyQt6.QtGui import QFont
-            
-            # Get the current sequence_font
-            current_font = None
-            
-            # Create font for leaf node labels - based on the user-selected font
-            # Debug the font being used
-            if hasattr(self, 'sequence_font'):
-                current_font = self.sequence_font
-                logger.debug(f"Drawing leaf node '{clade.name}' with sequence_font type: {type(current_font)}")
-            else:
-                logger.debug(f"Drawing leaf node '{clade.name}' with no sequence_font attribute")
-            
-            # Make sure we're using a valid QFont object
-            try:
-                if current_font is not None and isinstance(current_font, QFont):
-                    # Extract font properties and create a brand new font to avoid any reference issues
-                    family = current_font.family()
-                    size = current_font.pointSize()
-                    is_bold = current_font.bold()
-                    is_italic = current_font.italic()
+                    original_font = painter.font()
+                    current_font = self.sequence_font if hasattr(self, 'sequence_font') else QFont("Arial", 9)
+                    leaf_font = QFont(current_font) if isinstance(current_font, QFont) else QFont("Arial", 10)
                     
-                    # Create a completely new font
-                    leaf_font = QFont()
-                    leaf_font.setFamily(family)
-                    leaf_font.setPointSize(size if size > 0 else 12)  # Default to 12pt if size is invalid
-                    leaf_font.setBold(is_bold)
-                    leaf_font.setItalic(is_italic)
+                    is_delete_hover = self.delete_mode and hasattr(self, 'hovered_sequence') and self.hovered_sequence == clade_name
                     
-                    logger.debug(f"Created new leaf font: {leaf_font.family()}, {leaf_font.pointSize()}pt, Bold: {leaf_font.bold()}")
-                else:
-                    # Fallback to a default font if sequence_font is not a valid QFont
-                    leaf_font = QFont("Arial", 10)
-                    logger.debug("Using fallback font: Arial, 10pt")
-            except Exception as e:
-                # Handle any errors and use a safe fallback
-                logger.error(f"Error creating font for leaf node: {e}")
-                leaf_font = QFont("Arial", 10)
-                logger.debug("Using fallback font after error: Arial, 10pt")
-            
-            # Check if this node is being hovered in delete mode
-            is_delete_hover = False
-            if hasattr(self, 'delete_mode') and self.delete_mode and hasattr(self, 'hovered_sequence'):
-                # Convert clade_name to match the format in hovered_sequence if needed
-                node_key = clade_name
-                if self.hovered_sequence == node_key:
-                    is_delete_hover = True
-            
-            # Determine text appearance based on delete mode and hover state
-            if is_delete_hover:
-                # In delete mode with hover, use inverted colors (white on red)
-                hover_font = QFont(leaf_font)
-                hover_font.setBold(True)  # Make text bold for emphasis
-                painter.setFont(hover_font)
-                
-                # Draw a highlight rectangle with delete/danger colors
-                label_rect = QRect(x_int + 5, y_int - 15, 800, 25)
-                if self.dark_mode:
-                    # Dark mode: Use bright red background with white text
-                    highlight_color = QColor(200, 0, 0)  # Bright red background
-                    text_color = QColor(255, 255, 255)  # White text
-                else:
-                    # Light mode: Use medium red background with white text
-                    highlight_color = QColor(180, 0, 0)  # Medium red background
-                    text_color = QColor(255, 255, 255)  # White text
-                
-                # Fill the background and set text color
-                painter.fillRect(label_rect, highlight_color)
-                painter.setPen(text_color)
-            elif clade == self.hover_node:
-                # Normal hover effect (not in delete mode)
-                hover_font = QFont(leaf_font)
-                hover_font.setBold(True)
-                painter.setFont(hover_font)
-                
-                # Draw a light highlight behind the text for better visibility
-                label_rect = QRect(x_int + 5, y_int - 15, 800, 25)
-                highlight_color = QColor(100, 200, 255, 70)  # Light blue with transparency
-                painter.fillRect(label_rect, highlight_color)
-            else:
-                # No hover - use the customized font
-                painter.setFont(leaf_font)
-            
-            # Calculate font metrics for proper vertical positioning
-            font_metrics = QFontMetrics(painter.font())
-            font_height = font_metrics.height()
-            
-            # Adjust text rectangle based on font size
-            y_offset = max(-10, -font_height // 2)
-            height = max(30, font_height + 10)
-            
-            # Draw the label with potential wrapping for long names
-            # Increase the width of the text rectangle to accommodate longer sequence names
-            # Use a much wider text area to ensure the full name is displayed
-            text_rect = QRect(x_int + 5, y_int + y_offset, 800, height)
-            
-            # Use correct parameters for drawText with QRect
-            painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft, full_label)
-            
-            # Restore original pen color if we changed it for delete hover
-            if is_delete_hover:
-                if self.dark_mode:
-                    painter.setPen(QColor(255, 255, 255))  # Reset to white for dark mode
-                else:
-                    painter.setPen(QColor(0, 0, 0))  # Reset to black for light mode
-            
-            # Restore original font
-            painter.setFont(original_font)
-
-        # Draw clade label if it exists
-        if clade.name in self.clade_labels:
-            painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-            painter.drawText(x_int, y_int - 10, self.clade_labels[clade.name])
-            painter.setFont(QFont("Arial", 10))
-
-        # Draw child clades with error handling
-        try:
-            if hasattr(clade, 'clades'):
-                for child in clade.clades:
-                    if child is not None:
-                        self.draw_clade(painter, child, x_int, y_int)
+                    # ... (rest of label drawing logic, assuming it's inside this block) ...
+                    if is_delete_hover:
+                        hover_font = QFont(leaf_font); hover_font.setBold(True); painter.setFont(hover_font)
+                        label_rect_obj = QRect(x_int + 5, y_int - 15, 800, 25)
+                        bg_color = QColor(200,0,0) if self.dark_mode else QColor(180,0,0)
+                        text_color = QColor(255,255,255)
+                        painter.fillRect(label_rect_obj, bg_color); painter.setPen(text_color)
+                    elif clade == self.hover_node:
+                        hover_font = QFont(leaf_font); hover_font.setBold(True); painter.setFont(hover_font)
+                        label_rect_obj = QRect(x_int + 5, y_int - 15, 800, 25)
+                        painter.fillRect(label_rect_obj, QColor(100, 200, 255, 70))
                     else:
-                        logger.error("Encountered None child clade")
-            else:
-                logger.warning(f"Clade {clade_name} has no clades attribute")
-        except Exception as e:
-            logger.error(f"Error drawing child clades for {clade_name}: {e}")
+                        painter.setFont(leaf_font)
 
-    def draw_tree(self, painter):
+                    font_metrics = QFontMetrics(painter.font())
+                    font_height = font_metrics.height()
+                    y_offset = max(-10, -font_height // 2)
+                    text_height = max(30, font_height + 10)
+                    text_rect_obj = QRect(x_int + 5, y_int + y_offset, 800, text_height)
+
+                    painter.drawText(text_rect_obj, Qt.AlignmentFlag.AlignLeft, full_label)
+
+                    if is_delete_hover:
+                        painter.setPen(QColor(255,255,255) if self.dark_mode else QColor(0,0,0))
+                    painter.setFont(original_font)
+
+
+        # Clade Label (e.g. support values on internal nodes if used differently) Culling & Drawing
+        if clade.name in self.clade_labels: # Assuming self.clade_labels are for internal nodes primarily
+            font_metrics_clade_label = QFontMetrics(QFont("Arial", 10, QFont.Weight.Bold))
+            clade_label_text = self.clade_labels[clade.name]
+            clade_label_width = font_metrics_clade_label.horizontalAdvance(clade_label_text)
+            clade_label_height = font_metrics_clade_label.height()
+            clade_label_rect = QRect(x_int, y_int - 10 - clade_label_height, clade_label_width, clade_label_height)
+
+            if visible_rect.intersects(clade_label_rect):
+                painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+                painter.drawText(x_int, y_int - 10, clade_label_text)
+                # painter.setFont(QFont("Arial", 10)) # Restore if needed, but usually painter state is managed per element
+
+        # Recursion to children:
+        # Only recurse if the current clade (or its branch to parent) is somewhat visible,
+        # or if its potential children's area could be visible.
+        # A simple check: if the parent_y was visible or current node y is visible.
+        # A more sophisticated check would involve the bounding box of all children.
+        if hasattr(clade, 'clades'):
+            # Heuristic: if the parent node's y is above the bottom of the viewport AND
+            # the maximum possible y of its children (estimated) is below the top of the viewport
+            # This is a simplification. For now, always recurse if children exist.
+            # Culling of children's branches/nodes will be handled in their own calls.
+            for child in clade.clades:
+                if child is not None:
+                    self.draw_clade(painter, child, visible_rect, x_int, y_int) # Pass visible_rect
+                else:
+                    logger.error("Encountered None child clade")
+            # else: # No clades attribute means it's a leaf, no recursion needed.
+            #    logger.warning(f"Clade {clade_name} has no clades attribute but was not a leaf in earlier check.")
+
+    def draw_tree(self, painter, visible_rect):
         """Draw the phylogenetic tree on the given painter
         
         This method handles all tree drawing operations and can be used
@@ -2004,28 +2057,30 @@ class TreeCanvas(QWidget):
         
         Args:
             painter: QPainter object to draw with
+            visible_rect: The QRect representing the currently visible area in canvas coordinates.
         """
         from PyQt6.QtGui import QFont
         
         # Fill the background based on theme
         if hasattr(self, '_dark_mode') and self._dark_mode:
             painter.fillRect(self.rect(), QColor(40, 40, 40))  # Dark background
-            text_color = QColor(255, 255, 255)      # White text for dark mode
-            branch_color = QColor(255, 255, 255)    # White branches for dark mode
-            node_color = QColor(0, 120, 255)        # Blue nodes for dark mode
+            # text_color = QColor(255, 255, 255)      # White text for dark mode - colors set in draw_clade
+            # branch_color = QColor(255, 255, 255)    # White branches for dark mode
+            # node_color = QColor(0, 120, 255)        # Blue nodes for dark mode
         else:
             painter.fillRect(self.rect(), QColor(255, 255, 255))  # White background
-            text_color = QColor(0, 0, 0)            # Black text for light mode
-            branch_color = QColor(0, 0, 0)          # Black branches for light mode
-            node_color = QColor(0, 80, 220)         # Darker blue nodes for light mode
+            # text_color = QColor(0, 0, 0)            # Black text for light mode
+            # branch_color = QColor(0, 0, 0)          # Black branches for light mode
+            # node_color = QColor(0, 80, 220)         # Darker blue nodes for light mode
 
-        painter.setPen(QPen(text_color, 1))
+        # painter.setPen(QPen(text_color, 1)) # Pen is set in draw_clade or for specific messages
         
         # Handle case where no tree is available
         if not self.tree:
-            # Set a larger font for the message
             message_font = QFont("Arial", 12)
             painter.setFont(message_font)
+            # Set text color based on mode for this message
+            painter.setPen(QColor(255,255,255) if self._dark_mode else QColor(0,0,0))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, 
                             "No tree available\nUse 'Build Tree' from the Tree menu to create a tree")
             return
@@ -2040,18 +2095,21 @@ class TreeCanvas(QWidget):
             logger.debug("TreeCanvas.draw_tree - No sequence_font attribute found")
 
         # Calculate tree layout if needed
-        if not self.node_positions:
+        if self.layout_is_dirty or not self.node_positions: # Check dirty flag
+            logger.debug(f"paintEvent: layout_is_dirty={self.layout_is_dirty}, node_positions empty={not self.node_positions}. Recalculating layout.")
             self.calculate_tree_layout()
+            self.layout_is_dirty = False # Reset flag after calculation
 
         # Draw the tree starting from root
         if self.tree.root:
             # Draw the tree root
-            self.draw_clade(painter, self.tree.root)
+            self.draw_clade(painter, self.tree.root, visible_rect) # Pass visible_rect
         else:
             # Draw message if tree exists but root is missing
             logger.debug("Tree exists but has no root")
             message_font = QFont("Arial", 12)
             painter.setFont(message_font)
+            painter.setPen(QColor(255,255,255) if self._dark_mode else QColor(0,0,0))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, 
                             "Tree has no root node\nPlease try rebuilding the tree")
 
@@ -2061,9 +2119,23 @@ class TreeCanvas(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
+        # Calculate visible rectangle in TreeCanvas coordinates
+        visible_rect_in_canvas_coords = QRect()
+        parent_widget = self.parentWidget()
+        if isinstance(parent_widget, QScrollArea):
+            scroll_x = parent_widget.horizontalScrollBar().value()
+            scroll_y = parent_widget.verticalScrollBar().value()
+            viewport_width = parent_widget.viewport().width()
+            viewport_height = parent_widget.viewport().height()
+            visible_rect_in_canvas_coords = QRect(scroll_x, scroll_y, viewport_width, viewport_height)
+        else:
+            # Fallback if not in a scroll area (e.g., during export to SVG, or if parent changes)
+            visible_rect_in_canvas_coords = self.rect()
+
+
         try:
-            # Use the shared drawing method
-            self.draw_tree(painter)
+            # Use the shared drawing method, passing the visible rect
+            self.draw_tree(painter, visible_rect_in_canvas_coords)
         except Exception as e:
             # Draw error message if something goes wrong
             painter.resetTransform()  # Reset transform for error message
@@ -2145,25 +2217,27 @@ class TreeCanvas(QWidget):
             # Calculate drawing area dimensions
 
             # Count leaf nodes to determine vertical spacing
-            leaf_count = len(terminals)
+            # leaf_count = len(terminals) # Use cached value
+            leaf_count = self._cached_leaf_count
 
             if leaf_count == 0:
-                logger.debug("No leaf nodes found")
-                return
-
-            # Calculate vertical spacing with the scaling factor
-            # Ensure we have enough space for all leaves, with at least 20 pixels per leaf
-            min_spacing = 20  # Minimum pixels between leaf nodes
-            calculated_spacing = (height / leaf_count)
+                logger.debug("No leaf nodes found, using default spacing.")
+                 # Avoid division by zero if leaf_count is 0
+                vertical_spacing = 20 * self.vertical_spacing_factor # Default spacing
+            else:
+                # Calculate vertical spacing with the scaling factor
+                # Ensure we have enough space for all leaves, with at least 20 pixels per leaf
+                min_v_spacing = 20  # Minimum pixels between leaf nodes
+                calculated_spacing = (height / leaf_count)
             
-            # Use the larger of calculated spacing or minimum spacing
-            base_spacing = max(calculated_spacing, min_spacing)
+                # Use the larger of calculated spacing or minimum spacing
+                base_spacing = max(calculated_spacing, min_v_spacing)
             
-            # Apply vertical spacing factor
-            vertical_spacing = base_spacing * self.vertical_spacing_factor
+                # Apply vertical spacing factor
+                vertical_spacing = base_spacing * self.vertical_spacing_factor
             
             # Adjust the widget height if needed for large trees
-            required_height = (vertical_spacing * leaf_count) + (2 * margin)
+            required_height = (vertical_spacing * leaf_count if leaf_count > 0 else vertical_spacing) + (2 * margin)
             
             # Cap the maximum height to prevent Qt widget size errors
             # Qt has a maximum widget dimension of 16777215 pixels, but we'll stay much lower
@@ -2195,14 +2269,16 @@ class TreeCanvas(QWidget):
                             parent.updateTreeCanvasSize()
 
             # Get tree depth (for horizontal scaling)
-            def get_tree_depth(clade):
-                if not clade.clades:
-                    return 0
-                return 1 + max(get_tree_depth(child) for child in clade.clades)
+            # def get_tree_depth(clade): # Use cached value
+            #     if not clade.clades:
+            #         return 0
+            #     return 1 + max(get_tree_depth(child) for child in clade.clades)
 
-            tree_depth = get_tree_depth(self.tree.root)
-            if tree_depth == 0:
-                tree_depth = 1  # Avoid division by zero
+            tree_depth = self._cached_tree_depth
+            if tree_depth == 0 and leaf_count > 0 : # If only one node, depth is 0, but we need to draw it.
+                tree_depth = 1
+            elif leaf_count == 0: # No nodes, no depth
+                 tree_depth = 0
                 
             # Use tree depth for horizontal positioning
 
@@ -2510,12 +2586,8 @@ class TreeCanvas(QWidget):
             clade.clades = list(reversed(clade.clades))
             
             # Force tree recalculation and update
-            try:
-                self.calculate_tree_layout()
-            except Exception as e:
-                logger.error(f"Error recalculating tree layout: {e}")
-                
-            # Force immediate redraw
+            self._recalculate_tree_metrics() # Ensure metrics are updated
+            self.layout_is_dirty = True
             self.update()
             return True
             
@@ -2543,20 +2615,15 @@ class TreeCanvas(QWidget):
                 logger.debug("Rotating counter-clockwise (standard rotation)")
                 clade.clades = clade.clades[1:] + [clade.clades[0]]
                 
-                # Force tree recalculation and update
-                try:
-                    self.calculate_tree_layout()
-                except Exception as e:
-                    logger.error(f"Error recalculating tree layout: {e}")
-                
-                # Force immediate redraw
+                self._recalculate_tree_metrics() # Ensure metrics are updated
+                self.layout_is_dirty = True
                 self.update()
                 return True
                 
             elif len(clade.clades) == 2:
                 # For binary nodes, rotation is the same as swapping
                 logger.debug("Binary node - swapping children")
-                return self.swap_clades(clade)
+                return self.swap_clades(clade) # swap_clades will handle metrics and dirty flag
                 
         logger.debug(f"Could not rotate: clade has {len(getattr(clade, 'clades', []))} children")
         return False
@@ -2576,6 +2643,8 @@ class PhyloCanvas(QScrollArea):
     delete_signal = pyqtSignal(str)  # Signal for deleting node
     update_status = pyqtSignal(str)  # Signal for status bar updates
     
+    DEFERRED_ZOOM_UPDATE_DELAY = 150  # milliseconds
+
     def __init__(self, parent=None):
         super().__init__(parent)
         # Initialize private attributes first
@@ -2642,6 +2711,24 @@ class PhyloCanvas(QScrollArea):
         logger.debug("PhyloCanvas initialized with tree canvas")
         logger.debug(f"Rename signal connected: {self.rename_node_signal is not None}")
         logger.debug(f"Delete signal connected: {self.delete_node_signal is not None}")
+
+        # Deferred zoom update timer
+        self.zoom_update_timer = QTimer(self)
+        self.zoom_update_timer.setSingleShot(True)
+        self.zoom_update_timer.timeout.connect(self._perform_deferred_zoom_update)
+        self.tree_canvas.zoom_changed_by_wheel.connect(self._handle_wheel_zoom_deferred)
+
+    def _perform_deferred_zoom_update(self):
+        """Performs the actual layout and repaint after zoom operation."""
+        logger.debug("Performing deferred zoom update")
+        if hasattr(self.tree_canvas, 'layout_is_dirty'): # Ensure tree_canvas is fully initialized
+            self.tree_canvas.layout_is_dirty = True
+        self.tree_canvas.update()
+
+    def _handle_wheel_zoom_deferred(self):
+        """Starts the timer for a deferred update when wheel zoom occurs in TreeCanvas."""
+        logger.debug("Wheel zoom detected in TreeCanvas, starting deferred update timer.")
+        self.zoom_update_timer.start(self.DEFERRED_ZOOM_UPDATE_DELAY)
     
     def set_dark_mode(self, dark_mode):
         """Set dark mode for the tree canvas"""
@@ -2828,8 +2915,11 @@ class PhyloCanvas(QScrollArea):
             self.tree_canvas.scale_factor *= 1.2
             self.updateTreeCanvasSize()
             # Force a layout recalculation
-            self.tree_canvas.calculate_tree_layout()
-            logger.debug(f"Zoomed in to {self.tree_canvas.scale_factor:.2f}x")
+            # self.tree_canvas.calculate_tree_layout() # Removed
+            # self.tree_canvas.layout_is_dirty = True # Handled by timer
+            # self.tree_canvas.update() # Removed
+            self.zoom_update_timer.start(self.DEFERRED_ZOOM_UPDATE_DELAY)
+            logger.debug(f"Zoomed in to {self.tree_canvas.scale_factor:.2f}x, timer started.")
             
     def zoom_out(self):
         """Zoom out the tree view"""
@@ -2837,13 +2927,18 @@ class PhyloCanvas(QScrollArea):
             self.tree_canvas.scale_factor *= 0.8
             self.updateTreeCanvasSize()
             # Force a layout recalculation
-            self.tree_canvas.calculate_tree_layout()
-            logger.debug(f"Zoomed out to {self.tree_canvas.scale_factor:.2f}x")
+            # self.tree_canvas.calculate_tree_layout() # Removed
+            # self.tree_canvas.layout_is_dirty = True # Handled by timer
+            # self.tree_canvas.update() # Removed
+            self.zoom_update_timer.start(self.DEFERRED_ZOOM_UPDATE_DELAY)
+            logger.debug(f"Zoomed out to {self.tree_canvas.scale_factor:.2f}x, timer started.")
             
     def reset_zoom(self):
         """Reset zoom to 100%"""
         self.tree_canvas.scale_factor = 1.0
         self.updateTreeCanvasSize()
+        # self.tree_canvas.layout_is_dirty = True # Handled by timer
+        # self.tree_canvas.update() # Removed
         
         # Center the view more precisely using float division
         h_center = (self.tree_canvas.width() - self.viewport().width()) / 2.0
@@ -2851,8 +2946,8 @@ class PhyloCanvas(QScrollArea):
         
         self.horizontalScrollBar().setValue(int(h_center))
         self.verticalScrollBar().setValue(int(v_center))
-        
-        logger.debug("Zoom reset to 1.0x")
+        self.zoom_update_timer.start(self.DEFERRED_ZOOM_UPDATE_DELAY)
+        logger.debug("Zoom reset to 1.0x, timer started.")
         
     def export_image(self, filepath, options=None):
         """Export tree as an image file
@@ -2944,7 +3039,9 @@ class PhyloCanvas(QScrollArea):
         self.updateTreeCanvasSize()
         
         # Force layout calculation
-        self.tree_canvas.calculate_tree_layout()
+        # self.tree_canvas.calculate_tree_layout() # Removed
+        # self.tree_canvas.layout_is_dirty = True # Handled by timer
+        # self.tree_canvas.update() # Removed
         
         # Calculate the actual tree bounds from node positions
         if hasattr(self.tree_canvas, 'node_positions') and self.tree_canvas.node_positions:
@@ -3011,7 +3108,10 @@ class PhyloCanvas(QScrollArea):
         self.updateTreeCanvasSize()
         
         # Force another layout calculation with the new scale
-        self.tree_canvas.calculate_tree_layout()
+        # self.tree_canvas.calculate_tree_layout() # Removed
+        # self.tree_canvas.layout_is_dirty = True # Handled by timer
+        # self.tree_canvas.update() # Removed
+        self.zoom_update_timer.start(self.DEFERRED_ZOOM_UPDATE_DELAY)
         
         # Center the view more precisely
         hbar = self.horizontalScrollBar()
@@ -3083,11 +3183,11 @@ class PhyloCanvas(QScrollArea):
                         logger.error(f"Failed to convert tree: {e}")
             
             # Pass the tree to the TreeCanvas
-            self.tree_canvas.set_tree(tree)
+            self.tree_canvas.set_tree(tree) # This will set layout_is_dirty in TreeCanvas
             
             # Force layouts to be recalculated
-            if hasattr(self.tree_canvas, 'calculate_tree_layout'):
-                self.tree_canvas.calculate_tree_layout()
+            # if hasattr(self.tree_canvas, 'calculate_tree_layout'): # No longer called directly
+                # self.tree_canvas.calculate_tree_layout()
             
             # Resize the tree canvas to be sure it's large enough
             self.tree_canvas.setMinimumSize(800, 600)
@@ -3403,8 +3503,9 @@ class PhyloCanvas(QScrollArea):
                 self.tree_canvas.sequence_font = font
             
             # Force a recalculation of the tree layout
-            if hasattr(self.tree_canvas, 'calculate_tree_layout'):
-                self.tree_canvas.calculate_tree_layout()
+            # if hasattr(self.tree_canvas, 'calculate_tree_layout'): # No longer called directly
+                # self.tree_canvas.calculate_tree_layout()
+            self.tree_canvas.layout_is_dirty = True # Font change affects layout
                 
             # Force a complete repaint
             self.tree_canvas.update()

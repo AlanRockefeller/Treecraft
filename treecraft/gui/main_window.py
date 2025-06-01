@@ -890,6 +890,7 @@ class MainWindow(QMainWindow):
         
         # Load sequences
         try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             logger = logging.getLogger("treecraft")
             logger.info(f"Loading sequences from file: {file_path}")
             
@@ -984,6 +985,8 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Error loading sequences: {e}")
             QMessageBox.critical(self, "Error", f"Failed to load sequences: {str(e)}")
+        finally:
+            QApplication.restoreOverrideCursor()
             
     def update_sequence_count(self):
         """Update the sequence count in the header"""
@@ -2060,10 +2063,15 @@ PARAMETERS USED:
                 logger.info(f"Renamed tree node from '{old_name}' to '{new_name}'")
                 
         if renamed_count > 0:
-            # Force redraw of the tree with the updated names
-            self.tree_canvas.set_tree(self.current_tree)
-            self.tree_canvas.update()
-            logger.info(f"Updated {renamed_count} node names in tree")
+            # Names within self.current_tree (which is self.tree_canvas.tree_canvas.tree) are updated.
+            # We need to trigger a repaint of the TreeCanvas, not a full set_tree.
+            # The TreeCanvas's draw_clade will pick up the new names.
+            # No need to set layout_is_dirty as positions haven't changed.
+            if hasattr(self.tree_canvas, 'tree_canvas'):
+                self.tree_canvas.tree_canvas.update() # Call update on the actual TreeCanvas instance
+            else:
+                self.tree_canvas.update() # Fallback if direct tree_canvas not found (should not happen)
+            logger.info(f"Updated {renamed_count} node names in tree and triggered TreeCanvas repaint.")
     
     def delete_tree_node(self, node_name):
         """Delete a sequence from the tree and dataset via right-click"""
