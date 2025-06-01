@@ -302,6 +302,15 @@ class SequenceListWidget(QListWidget):
         self.descriptions = {}
         self.clear()
         
+    def clear_all_sequences(self):
+        # import logging # Add this if logger is used here, or pass logger instance
+        # logger = logging.getLogger("treecraft.sequence_list")
+        # logger.info("Clearing all sequences from SequenceListWidget.")
+        print("SequenceListWidget: Clearing all sequences.") # Using print for now if logger not set up here
+        self.sequences.clear()
+        self.descriptions.clear()
+        self.clear() # QListWidget's clear method for items
+
     def remove_sequence(self, sequence_id):
         """Remove a specific sequence by ID"""
         if sequence_id in self.sequences:

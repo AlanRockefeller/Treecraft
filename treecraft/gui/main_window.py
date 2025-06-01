@@ -358,6 +358,10 @@ class MainWindow(QMainWindow):
         # Debug console action
         self.debug_console_action = QAction("Debug &Console", self)
         self.debug_console_action.setStatusTip("Show debug console with log messages")
+
+        self.open_tree_action = QAction("&Open Tree File...", self)
+        self.open_tree_action.setStatusTip("Open a tree file (Newick, Nexus, PhyloXML)")
+        # self.open_tree_action.setShortcut("Ctrl+Shift+O") # Optional shortcut
     
     def create_menubar(self):
         """Create the menu bar"""
@@ -366,6 +370,7 @@ class MainWindow(QMainWindow):
         # File menu
         file_menu = menubar.addMenu("&File")
         file_menu.addAction(self.open_action)
+        file_menu.addAction(self.open_tree_action) # Added here
         file_menu.addSeparator()
         file_menu.addAction(self.export_sequences_action)
         file_menu.addAction(self.export_alignment_action)
@@ -524,6 +529,7 @@ class MainWindow(QMainWindow):
         """Connect signals to slots"""
         # File menu
         self.open_action.triggered.connect(self.on_open)
+        self.open_tree_action.triggered.connect(self.on_open_tree_file) # Added here
         self.export_sequences_action.triggered.connect(self.on_export_sequences)
         self.export_alignment_action.triggered.connect(self.on_export_alignment)
         self.export_tree_action.triggered.connect(self.on_export_tree)
@@ -994,6 +1000,90 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to load sequences: {str(e)}")
         finally:
             QApplication.restoreOverrideCursor() # Restore cursor in finally block
+
+    def on_open_tree_file(self):
+        logger = logging.getLogger("treecraft")
+        logger.info("Attempting to open a tree file...")
+
+        # Ensure necessary imports are within the method or at class/module level
+        # from PyQt6.QtWidgets import QFileDialog, QApplication, QMessageBox # Already imported
+        # from PyQt6.QtCore import Qt # Already imported
+        # from Bio import Phylo # Imported locally below
+        # import os # Already imported
+
+        dialog = QFileDialog(self)
+        dialog.setWindowTitle("Open Tree File")
+        dialog.setNameFilter("Tree Files (*.nwk *.newick *.nex *.nexus *.xml *.phyloxml);;Newick (*.nwk *.newick);;Nexus (*.nex *.nexus);;PhyloXML (*.xml *.phyloxml);;All Files (*)")
+        dialog.setViewMode(QFileDialog.ViewMode.List)
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+
+        tree_object = None
+        tree_file_path_for_status = "Unknown" # For status bar message
+
+        if dialog.exec():
+            selected_files = dialog.selectedFiles()
+            if selected_files:
+                tree_file_path = selected_files[0]
+                tree_file_path_for_status = os.path.basename(tree_file_path)
+                file_ext = os.path.splitext(tree_file_path)[1].lower()
+
+                format_hint = "newick" # Default
+                if file_ext in (".nex", ".nexus"):
+                    format_hint = "nexus"
+                elif file_ext in (".xml", ".phyloxml"):
+                    format_hint = "phyloxml"
+
+                logger.info(f"User selected tree file: {tree_file_path} (format hint: {format_hint})")
+
+                try:
+                    QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+                    from Bio import Phylo
+                    tree_object = Phylo.read(tree_file_path, format_hint)
+
+                    if tree_object:
+                        # Process quoted names
+                        for clade in tree_object.get_terminals() + list(tree_object.get_nonterminals()):
+                            if clade.name:
+                                if clade.name.startswith("'") and clade.name.endswith("'"):
+                                    clade.name = clade.name[1:-1]
+                                elif clade.name.startswith('"') and clade.name.endswith('"'):
+                                    clade.name = clade.name[1:-1]
+                        logger.info(f"Successfully parsed tree from {tree_file_path_for_status}")
+                except Exception as e:
+                    logger.error(f"Failed to load or parse tree file '{tree_file_path}': {e}")
+                    QMessageBox.critical(self, "Error Opening Tree", f"Failed to load tree file: {str(e)}")
+                    tree_object = None
+                finally:
+                    QApplication.restoreOverrideCursor()
+
+        if tree_object:
+            self.current_tree = tree_object
+
+            logger.info("Clearing existing sequence list and alignment for new tree display.")
+            if hasattr(self.sequence_list, 'clear_all_sequences') and callable(getattr(self.sequence_list, 'clear_all_sequences')):
+                self.sequence_list.clear_all_sequences()
+            else:
+                logger.info("Manually clearing sequence_list (no clear_all_sequences method found).")
+                self.sequence_list.sequences.clear()
+                self.sequence_list.descriptions.clear()
+                self.sequence_list.clear()
+
+            self.current_alignment = None
+            if self.alignment_viewer:
+                self.alignment_viewer.set_alignment(None)
+
+            self.update_sequence_count() # Update "Sequences: 0" label
+
+            self.tree_canvas.set_tree(self.current_tree)
+            self.statusbar.showMessage(f"Opened tree file: {tree_file_path_for_status}", 5000)
+            logger.info(f"Tree '{tree_file_path_for_status}' set to display.")
+        else:
+            # Only show "failed" if a file was actually selected.
+            if dialog.result() == QDialog.DialogCode.Accepted and tree_file_path_for_status != "Unknown":
+                self.statusbar.showMessage("Failed to open or parse tree file.", 3000)
+            else: # Dialog was cancelled or no file selected
+                self.statusbar.showMessage("Open tree file cancelled.", 3000)
+            logger.info("Tree loading failed, was cancelled, or no file selected.")
             
     def update_sequence_count(self):
         """Update the sequence count in the header"""
@@ -1008,8 +1098,8 @@ class MainWindow(QMainWindow):
             return
         
         # Get logger instance
-        import logging
-        logger = logging.getLogger("treecraft")
+        import logging # Ensure logger is available
+        logger = logging.getLogger("treecraft") # Ensure logger is available
             
         # Extract the sequence order from the list widget to match the sequence list display
         sequence_ids_in_order = []
@@ -1042,27 +1132,47 @@ class MainWindow(QMainWindow):
                 record = SeqRecord(Seq(sequence), id=seq_id, description=description)
                 records.append(record)
 
-        if not records:
+        # <<< LOGGING START >>>
+        logger.debug(f"Entering update_alignment_display_from_sequences. Number of records: {len(records)}")
+        if not records: # This check is technically redundant due to the one at the very top of the function
+            logger.debug("Record list is empty (second check).")
             self.current_alignment = None
             self.alignment_viewer.set_alignment(None)
-            # Reset the vertical scroll position to match the sequence list
             QTimer.singleShot(100, lambda: self.sync_alignment_scroll_position())
             return
+        else:
+            for i, r in enumerate(records):
+                logger.debug(f"Record {i}: ID='{r.id}', Length={len(r.seq)}, Description='{r.description}'")
+                # logger.debug(f"Record {i} Seq Sample: {r.seq[:30]}...") # Optional: log sequence sample
+        # <<< LOGGING END >>>
 
         lengths = [len(record.seq) for record in records]
-        all_same_length = all(l == lengths[0] for l in lengths) if lengths else True
+        all_same_length = all(l == lengths[0] for l in lengths) if lengths else True # Keep `if lengths else True` for safety, though `if not records` above should catch empty.
+
+        # <<< LOGGING START >>>
+        logger.debug(f"Calculated lengths: {lengths}")
+        logger.debug(f"Result of all_same_length check: {all_same_length}")
+        # <<< LOGGING END >>>
 
         if all_same_length:
-            # Proceed with creating a formal MultipleSeqAlignment object
+            # <<< LOGGING START >>>
+            logger.debug("All sequences reported as same length. Attempting to create MultipleSeqAlignment object.")
+            # <<< LOGGING END >>>
             alignment = MultipleSeqAlignment(records)
-            self.current_alignment = alignment # Store the actual MSA object
+            self.current_alignment = alignment
             self.alignment_viewer.set_alignment(alignment)
-            logger.debug("Created MultipleSeqAlignment as all sequences are of the same length.")
+            # logger.debug("Created MultipleSeqAlignment as all sequences are of the same length.") # Redundant with above
         else:
-            # Log a message and display sequences as a list
             logger.info("Displaying sequences in alignment view; sequences are not of uniform length and won't be treated as a formal alignment.")
-            self.current_alignment = records # Store the list of records
-            self.alignment_viewer.set_alignment(records) # AlignmentViewer can handle a list of SeqRecords
+            self.current_alignment = records
+            self.alignment_viewer.set_alignment(records)
+
+        # <<< LOGGING START >>>
+        if self.current_alignment is None:
+            logger.debug("self.current_alignment is None after update_alignment_display.")
+        else:
+            logger.debug(f"self.current_alignment is now type: {type(self.current_alignment)}, Number of sequences in current_alignment: {len(self.current_alignment) if self.current_alignment is not None else 0}")
+        # <<< LOGGING END >>>
 
         # Reset the vertical scroll position to match the sequence list
         QTimer.singleShot(100, lambda: self.sync_alignment_scroll_position())
@@ -1518,27 +1628,33 @@ class MainWindow(QMainWindow):
                 temp_dir = tempfile.mkdtemp(prefix="raxml_")
                 
                 # --- RAxML Name Handling: Pre-processing ---
-                self.raxml_name_map = {} # Ensure it's fresh for this run
+                self.raxml_name_map = {} # Ensure it's fresh for this run (using self.raxml_name_map consistently)
                 sanitized_records = []
-                # Ensure self.current_alignment is a list of SeqRecords if it's an MSA object
                 alignment_records = list(self.current_alignment) if isinstance(self.current_alignment, MultipleSeqAlignment) else self.current_alignment
 
                 logger.info(f"Preparing alignment for RAxML. Original alignment has {len(alignment_records)} records.")
 
                 for i, record in enumerate(alignment_records):
                     original_full_name = record.description if record.description and record.description.strip() else record.id
-                    # RAxML requires simple names, typically <=10 chars for some older formats it might interact with,
-                    # though modern RAxML-ng is more flexible. Using a simple, unique, safe ID.
-                    sanitized_id = f"SEQ_{i}"
+                    sanitized_id = f"s{i}" # Use simple 's0', 's1', ... style IDs
                     self.raxml_name_map[sanitized_id] = original_full_name
-                    # Create a new SeqRecord with the sanitized ID and original sequence.
-                    # RAxML generally only cares about the ID in the > line for the tree.
+                    # Write FASTA with only the sanitized ID and empty description for RAxML
                     sanitized_records.append(SeqRecord(record.seq, id=sanitized_id, description=""))
-                    logger.debug(f"Mapping: '{sanitized_id}' -> '{original_full_name}'")
+                    # logger.debug(f"Mapping: '{sanitized_id}' -> '{original_full_name}'") # Logged below
+
+                # Log first 5 entries of the map for debugging
+                logged_map_entries = 0
+                for k, v in self.raxml_name_map.items():
+                    logger.debug(f"RAxML Name Map: '{k}' -> '{v}'")
+                    logged_map_entries += 1
+                    if logged_map_entries >= 5:
+                        break
+                if len(self.raxml_name_map) > 5:
+                    logger.debug(f"... and {len(self.raxml_name_map) - 5} more entries.")
 
                 aligned_file_path = os.path.join(temp_dir, "alignment_sanitized_for_raxml.fasta")
                 SeqIO.write(sanitized_records, aligned_file_path, "fasta")
-                logger.info(f"RAxML pre-processing: Wrote {len(sanitized_records)} records with sanitized names to {aligned_file_path}")
+                logger.info(f"RAxML pre-processing: Wrote {len(sanitized_records)} records with sanitized names (e.g., s0, s1...) to {aligned_file_path}")
                 # --- End RAxML Name Handling: Pre-processing ---
                 
                 # Run RAxML with progress dialog
@@ -1549,26 +1665,52 @@ class MainWindow(QMainWindow):
                     tree_file = find_tree_file(tree_dir)
                     
                     if tree_file and os.path.exists(tree_file):
+                        # Log raw tree sample
+                        try:
+                            with open(tree_file, 'r') as f:
+                                raw_tree_sample = f.read(200)
+                            logger.debug(f"RAxML raw tree sample: {raw_tree_sample.strip()}...")
+                        except Exception as e:
+                            logger.error(f"Could not read sample from tree file '{tree_file}': {e}")
+
                         from Bio import Phylo
                         tree = Phylo.read(tree_file, "newick")
                         
                         # --- RAxML Name Handling: Post-processing ---
+                        # The map from result_info might be based on RAxML's internal sanitization if it differs.
+                        # Forcing use of self.raxml_name_map as the primary source of truth.
+                        # raxml_output_name_map = result_info.get("sequence_name_map", {})
+                        # if raxml_output_name_map:
+                        #     logger.info(f"RAxML's run_raxml returned a name map with {len(raxml_output_name_map)} entries. Prioritizing self.raxml_name_map.")
+                            # Example: if RAxML changed 's1' to 'T1', raxml_output_name_map might be {'T1': 's1'}
+                            # We need to map from what's in the tree file (e.g. 'T1') back to our original name.
+                            # This requires careful chaining if RAxML internally renames our 'sX' IDs.
+                            # For now, assume RAxML uses 'sX' as-is due to their simplicity.
+
                         logger.info(f"RAxML post-processing: Restoring original names using self.raxml_name_map ({len(self.raxml_name_map)} entries).")
                         restored_count = 0
                         not_found_count = 0
-                        for terminal in tree.get_terminals():
-                            sanitized_name = terminal.name # This will be "SEQ_0", "SEQ_1", etc.
-                            if sanitized_name in self.raxml_name_map:
-                                original_name = self.raxml_name_map[sanitized_name]
-                                terminal.name = original_name
-                                restored_count +=1
-                                logger.debug(f"Restored RAxML name: '{sanitized_name}' -> '{original_name}'")
+                        problematic_names_from_tree = []
+
+                        for terminal_node in tree.get_terminals(): # Use a different variable name here
+                            name_from_tree = terminal_node.name
+                            logger.debug(f"Processing terminal from tree: '{name_from_tree}'")
+
+                            original_name = self.raxml_name_map.get(name_from_tree)
+
+                            if original_name:
+                                terminal_node.name = original_name
+                                restored_count += 1
+                                logger.debug(f"Restored RAxML name: '{name_from_tree}' -> '{original_name}'")
                             else:
                                 not_found_count +=1
-                                logger.warning(f"RAxML post-processing: Could not find original name for sanitized ID: '{sanitized_name}' in map.")
+                                problematic_names_from_tree.append(name_from_tree)
+                                logger.warning(f"RAxML post-processing: Could not find original name for ID '{name_from_tree}' in self.raxml_name_map.")
+
                         logger.info(f"RAxML name restoration: {restored_count} names restored, {not_found_count} not found in map.")
-                        if not_found_count > 0 and restored_count < len(sanitized_records): # Log map if there were issues
-                             logger.warning(f"RAxML Name Map dump for problematic tree: {self.raxml_name_map}")
+                        if not_found_count > 0:
+                             logger.warning(f"Problematic names from RAxML tree file (not found in map): {problematic_names_from_tree}")
+                             logger.warning(f"RAxML Name Map dump for problematic tree (self.raxml_name_map has {len(self.raxml_name_map)} entries): First few: {dict(list(self.raxml_name_map.items())[:5])}")
                         # --- End RAxML Name Handling: Post-processing ---
                         
                         self.current_tree = tree
